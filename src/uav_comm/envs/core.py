@@ -255,11 +255,12 @@ class UAVEnv(gym.Env):
         return optimal_location
 
     def get_action_mask(self):
-        # Mask for MultiDiscrete is tricky in SB3.
-        # Usually ActionMasker expects Discrete.
-        # For MultiDiscrete, we might need a custom wrapper or just rely on penalty.
-        # But let's return the basic boolean mask for active users.
-        return (self.needs > self.progress)
+        # For MultiDiscrete, we return a list of masks, one for each dimension.
+        # Each dimension corresponds to an antenna array, which can select any user.
+        # The mask for each array is the same: valid users (active needs).
+        user_mask = (self.needs > self.progress)
+        # Duplicate this mask for each array
+        return [user_mask] * self.num_arrays
 
     def _get_observation(self):
         needs_progress = self.needs - self.progress

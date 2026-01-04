@@ -3,7 +3,8 @@ import os
 import sys
 import yaml
 import numpy as np
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback
 
@@ -15,6 +16,9 @@ def load_train_config(config_path="configs/train_config.yaml"):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
+def mask_fn(env):
+    return env.get_action_mask()
+
 def train():
     print("Loading Configs...")
     config = load_train_config()
@@ -25,17 +29,24 @@ def train():
     from src.uav_comm.utils.config_loader import load_config as load_env_config
     env_config = load_env_config()
 
-    print("Initializing Multi-User Environment...")
+    print("Initializing Multi-User Environment with Action Masking...")
+
+    # Create env function that includes ActionMasker
+    def make_env():
+        env = UAVEnv(config=env_config)
+        env = ActionMasker(env, mask_fn)
+        return env
+
     # Wrap in DummyVecEnv for SB3
-    env = DummyVecEnv([lambda: UAVEnv(config=env_config)])
+    env = DummyVecEnv([make_env])
 
     # Normalize Env? Typically good for PPO.
     # Exclude 'user_satisfied' as it is MultiBinary
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., norm_obs_keys=['needs', 'directions', 'distance'])
 
-    print("Initializing PPO Agent (MultiDiscrete Support)...")
+    print("Initializing MaskablePPO Agent (MultiDiscrete Support)...")
     # PPO naturally supports MultiDiscrete
-    model = PPO(
+    model = MaskablePPO(
         "MultiInputPolicy",
         env,
         verbose=1,

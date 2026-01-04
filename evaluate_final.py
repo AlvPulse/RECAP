@@ -3,7 +3,8 @@ import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from stable_baselines3 import PPO
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 sys.path.append(os.getcwd())
@@ -11,24 +12,33 @@ sys.path.append(os.getcwd())
 from src.uav_comm.envs.core import UAVEnv
 from src.uav_comm.agents.baselines import MultiUserBaselines
 
+def mask_fn(env):
+    return env.get_action_mask()
+
 def evaluate_final():
     from src.uav_comm.utils.config_loader import load_config as load_env_config
     print("Starting Final Evaluation...")
 
     env_config = load_env_config()
 
-    # Setup Env
+    # Setup Env for Baselines (No masking needed for baselines logic, but physics matches)
     env = UAVEnv(config=env_config)
     baselines = MultiUserBaselines(env)
 
     # Load RL
     # We need the normalized env wrapper to load the stats
-    env_rl_wrapped = DummyVecEnv([lambda: UAVEnv(config=env_config)])
+    # And we need to wrap with ActionMasker inside the DummyVecEnv
+    def make_env():
+        e = UAVEnv(config=env_config)
+        e = ActionMasker(e, mask_fn)
+        return e
+
+    env_rl_wrapped = DummyVecEnv([make_env])
     env_rl_wrapped = VecNormalize.load("vec_normalize.pkl", env_rl_wrapped)
     env_rl_wrapped.training = False
     env_rl_wrapped.norm_reward = False
 
-    model = PPO.load("ppo_multi_user_final", env=env_rl_wrapped)
+    model = MaskablePPO.load("ppo_multi_user_final", env=env_rl_wrapped)
 
     # Run episodes
     n_episodes = 1
@@ -58,7 +68,7 @@ def evaluate_final():
             tot += reward
         rewards_fcfs.append(tot)
 
-    print("\nEvaluating RL (PPO)...")
+    print("\nEvaluating RL (MaskablePPO)...")
     for i in range(n_episodes):
         # Reset wrapped env
         env_rl_wrapped.seed(i)
@@ -66,7 +76,11 @@ def evaluate_final():
         done = False
         tot = 0
         while not done:
-            action, _ = model.predict(obs)
+            # Masking handled automatically by wrapped env + MaskablePPO if configured right,
+            # or we pass mask explicitly.
+            # With ActionMasker wrapped inside VecEnv, sb3_contrib usually handles it.
+            # predict() will look for action_masks in the env.
+            action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, _ = env_rl_wrapped.step(action)
             tot += reward
         rewards_rl.append(tot) # Note: reward here is unnormalized because we set norm_reward=False
