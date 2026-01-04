@@ -20,7 +20,12 @@ def load_train_config(config_path="configs/train_config.yaml"):
         return yaml.safe_load(f)
 
 def mask_fn(env):
-    return env.get_action_mask()
+    # ActionMasker might pass a wrapped env (e.g., Monitor).
+    # We need to access get_action_mask from the base environment.
+    # Gymnasium wrappers typically support direct access if the method exists,
+    # but some versions/wrappers might not.
+    # Using getattr or accessing unwrapped is safer.
+    return env.unwrapped.get_action_mask()
 
 def train():
     print("Loading Configs...")
