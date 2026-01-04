@@ -1,0 +1,11 @@
+
+num_users: 8
+num_arrays: 4
+num_elements_per_array: 8
+max_episode_time: 30
+uav_speed: 30
+uav_height: 50
+max_range: 500
+bandwidth: 0.35
+sinr_threshold_db: 3
+switch_cost: 0.25
