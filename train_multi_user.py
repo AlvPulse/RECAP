@@ -45,10 +45,13 @@ def train():
         mlflow.log_artifact("configs/train_config.yaml")
         mlflow.log_artifact("configs/env_config.yaml")
 
+        from stable_baselines3.common.monitor import Monitor
         print("Initializing Multi-User Environment with Action Masking...")
 
         def make_env():
             env = UAVEnv(config=env_config)
+            # Monitor is required for logging episode stats (reward, length) to MLflow
+            env = Monitor(env)
             env = ActionMasker(env, mask_fn)
             return env
 
@@ -80,6 +83,7 @@ def train():
         model.learn(total_timesteps=train_config['total_timesteps'], callback=mlflow_callback)
 
         print("Training Complete. Saving Model...")
+        os.makedirs("models", exist_ok=True)
         model_save_path = f"models/{run_name}"
         model.save(model_save_path)
         env.save(f"models/{run_name}_vec_normalize.pkl")

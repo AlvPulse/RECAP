@@ -137,7 +137,11 @@ def pert2d_null_multi(D, PhaseTable, theta, phi, R, thetaN, phiN, RN, Noise_leve
     FoMTarget = Noise_level + 3
     N = len(PhaseCodeBest)
 
-    while FOMAltering > FoMTarget:
+    # Safety: Max iterations to prevent infinite/long loops in optimization
+    # The original loop could run very long if improvement is slow.
+    MAX_ITERS = 1000
+
+    while FOMAltering > FoMTarget and IterNumber < MAX_ITERS:
         PhaseCodeAltering = PhaseCodeBest.copy()
         Flag, ElementIndex = find_most_effective_null_multi(D, theta, phi, thetaN, phiN, WeightsN, PhaseCodeAltering, IndNumber)
         PhaseCodeAltering[ElementIndex] += 180

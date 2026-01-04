@@ -144,6 +144,9 @@ class UAVEnv(gym.Env):
             reward += bonus
 
         Truncated = self.current_time >= self.config['max_episode_time']
+        if Truncated:
+            # Penalty for not finishing in time to encourage speed
+            reward -= 10.0
 
         observation = self._get_observation()
         info = {"JFI": jfi, "Bandwidth": 0, "Thr_fairness": prop_reward} # Bandwidth placeholder
