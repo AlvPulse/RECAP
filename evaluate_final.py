@@ -33,12 +33,21 @@ def evaluate_final():
         e = ActionMasker(e, mask_fn)
         return e
 
+    # Check if latest model exists
+    latest_stats_path = "models/vec_normalize_latest.pkl"
+    latest_model_path = "models/ppo_multi_user_latest"
+
+    if not os.path.exists(latest_stats_path) or not os.path.exists(latest_model_path + ".zip"):
+        print("Error: Latest model not found. Run training first.")
+        sys.exit(1)
+
     env_rl_wrapped = DummyVecEnv([make_env])
-    env_rl_wrapped = VecNormalize.load("vec_normalize.pkl", env_rl_wrapped)
+    env_rl_wrapped = VecNormalize.load(latest_stats_path, env_rl_wrapped)
     env_rl_wrapped.training = False
     env_rl_wrapped.norm_reward = False
 
-    model = MaskablePPO.load("ppo_multi_user_final", env=env_rl_wrapped)
+    print(f"Loading Model from {latest_model_path}...")
+    model = MaskablePPO.load(latest_model_path, env=env_rl_wrapped)
 
     # Run episodes
     n_episodes = 1
