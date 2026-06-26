@@ -9,3 +9,4 @@ max_range: 500
 bandwidth: 0.35
 sinr_threshold_db: 3
 switch_cost: 0.25
+operation_mode: multi   # 'single': all arrays → one user | 'multi': each array independent

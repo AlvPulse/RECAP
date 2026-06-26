@@ -2,13 +2,11 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import copy
 
-from src.uav_comm.components.channel import total_path_loss, calculate_noise_level_db, landa
+from src.uav_comm.components.channel import total_path_loss, calculate_noise_level_db
 from src.uav_comm.components.antenna import array_locs, pert2d_null_multi, phase_code_finder, find_gain_of_tphi
-from src.uav_comm.components.rewards import calculate_reward_function, RewardTracker, MAX_NEED
+from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
 
-# Default Configs
 DEFAULT_CONFIG = {
     'num_users': 8,
     'num_arrays': 4,
@@ -20,12 +18,16 @@ DEFAULT_CONFIG = {
     'max_range': 500,
     'max_episode_time': 30,
     'uav_speed': 30,
-    'switch_cost': 0.25
+    'switch_cost': 0.25,
+    # 'single': all arrays beam to the same user (max combining gain on one user)
+    # 'multi':  each array independently selects a user (serve multiple users per step)
+    'operation_mode': 'multi',
 }
+
 
 class UAVEnv(gym.Env):
     def __init__(self, config=None):
-        super(UAVEnv, self).__init__()
+        super().__init__()
 
         self.config = DEFAULT_CONFIG.copy()
         if config:
@@ -35,249 +37,223 @@ class UAVEnv(gym.Env):
         self.num_arrays = self.config['num_arrays']
         self.num_elements_per_array = self.config['num_elements_per_array']
 
-        self.current_time = 0.0
-
         self.bts_gain = 10 ** (50 / 10) * 10 ** (10 / 10)
         self.uav_user_gain = 10 ** (24 / 10) * 10 ** (0 / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
         self.array_configs = [array_locs(self.num_elements_per_array) for _ in range(self.num_arrays)]
 
-        # --- ACTION SPACE UPGRADE ---
-        # Original: Discrete(num_users) - Single user selection
-        # New: MultiDiscrete([num_users] * num_arrays) - Independent selection per array
-        self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
+        if self.config['operation_mode'] == 'single':
+            # Mode a: one discrete user choice, all arrays point there
+            self.action_space = spaces.Discrete(self.num_users)
+        else:
+            # Mode b: each array independently picks a user
+            self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
 
         self.observation_space = spaces.Dict({
-            'needs': spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
-            'directions': spaces.Box(low=-0.5, high=0.5, shape=(self.num_users,), dtype=np.float64),
-            'distance': spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
-            'user_satisfied': spaces.MultiBinary(self.num_users)
+            'needs':          spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            'directions':     spaces.Box(low=-0.5, high=0.5, shape=(self.num_users,), dtype=np.float64),
+            'distance':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            'user_satisfied': spaces.MultiBinary(self.num_users),
+            'remaining_time': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float64),
         })
 
-        self.reward_tracker = RewardTracker()
         self.reset()
-        self.last_action = None
 
     def reset(self, seed=None, options=None):
-        if seed:
+        if seed is not None:
             np.random.seed(seed)
 
         range_lim = self.config['max_range']
         self.locations = np.random.uniform(-range_lim, range_lim, (self.num_users, 2))
-        self.uav_position = np.random.uniform(-range_lim/2, range_lim/2, (2,))
+        self.uav_position = np.random.uniform(-range_lim / 2, range_lim / 2, (2,))
         self.needs = np.zeros(self.num_users)
         self.progress = np.zeros(self.num_users)
         self.sinr = np.zeros(self.num_users)
         self.delay = np.zeros(self.num_users)
         self.current_time = 0.0
+        self.last_action = None
 
-        for user_idx in range(self.num_users):
-            self._declare_need(user_idx)
+        for i in range(self.num_users):
+            self._declare_need(i)
 
         return self._get_observation(), {}
 
     def step(self, action):
-        switch_cost = self.config['switch_cost']
         self.current_time += self.config['time_interval']
 
-        # --- ACTION HANDLING ---
-        # Handle scalar (single-user legacy) or array (multi-user)
-        if isinstance(action, (int, np.integer)):
-            selected_users = action * np.ones(self.num_arrays, dtype=int)
+        # Resolve per-array user assignments from action
+        if self.config['operation_mode'] == 'single':
+            uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
+            selected_users = np.full(self.num_arrays, uid, dtype=int)
+        elif isinstance(action, (int, np.integer)):
+            selected_users = np.full(self.num_arrays, int(action), dtype=int)
         elif isinstance(action, np.ndarray) and action.ndim == 0:
-            selected_users = action.item() * np.ones(self.num_arrays, dtype=int)
+            selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
         else:
             selected_users = action.astype(int)
 
         self._calculate_sinr(selected_users)
 
         active_users = (self.needs > 0) & (self.needs > self.progress)
-
         for i in range(self.num_users):
             if active_users[i]:
                 self.delay[i] += 1
 
-        Throughput = 0
+        throughputs_per_user = np.zeros(self.num_users)
+        for uid in np.unique(selected_users):
+            if active_users[uid]:
+                throughputs_per_user[uid] = self._serve_user(uid)
 
-        # In multi-user, an array serves a user.
-        # A user might be served by MULTIPLE arrays (constructive) or distinct ones.
-        # _serve_user uses self.sinr which aggregates signal/interference.
-        # But wait, self.sinr is per USER. So we just iterate over UNIQUE selected users to accrue throughput?
-        # Or iterate over arrays?
-        # Throughput depends on SINR. SINR is calculated once per step based on configuration.
-        # So we just update progress for ALL selected users based on their SINR.
+        self._update_uav_location(selected_users)
 
-        unique_selected_users = np.unique(selected_users)
-        for user_idx in unique_selected_users:
-            if active_users[user_idx]:
-                Throughput += self._serve_user(user_idx)
-
-        mean_distance = self._update_uav_location(selected_users)
-
-        raw_reward, jfi, sinr_reward, prop_reward, ep_reward = calculate_reward_function(
-            Throughput, mean_distance, self.delay, self.progress, self.needs, active_users, self.current_time
+        raw_reward, jfi_delay, urgency_thr, min_progress, total_thr = calculate_reward_function(
+            throughputs_per_user, self.delay, self.progress, self.needs,
+            active_users, self.current_time, self.config['max_episode_time']
         )
 
-        # Normalize
-        # But wait, Env used stateful normalization.
-        norm_reward = self.reward_tracker.normalize(raw_reward)
-        reward = raw_reward / 10 # Preserving original scaling logic
+        # Safety net: penalise targeting already-satisfied users.
+        # Action masking should prevent this; penalty is at raw scale (consistent with /10 below).
+        inactive = np.where(~active_users)[0]
+        wrong_count = int(np.sum(np.isin(selected_users, inactive)))
+        if wrong_count > 0:
+            raw_reward -= wrong_count * 2
 
-        # Penalty for inactive users
-        inactive_user_indices = np.where(~active_users)[0]
-        matches = np.isin(selected_users, inactive_user_indices)
-        Wrong_count = np.sum(matches)
-        reward = reward - Wrong_count * 10
-
-        # New needs logic
-        if np.random.rand() < 0.2:
-            if len(inactive_user_indices) > 0:
-                selected_index = np.random.choice(inactive_user_indices)
-                if self.needs[selected_index] == 0:
-                    self._declare_need(selected_index)
-
-        done = np.all(self.progress >= self.needs)
-        if done:
-            time_bonus_coeff = 0.0002
-            bonus = time_bonus_coeff * (self.config['max_episode_time'] - self.current_time)**2
-            reward += bonus
-
-        Truncated = self.current_time >= self.config['max_episode_time']
-
-        observation = self._get_observation()
-        info = {"JFI": jfi, "Bandwidth": 0, "Thr_fairness": prop_reward} # Bandwidth placeholder
-
+        # Switch cost applied at raw scale so it stays proportionate after /10
         if self.last_action is not None and not np.array_equal(action, self.last_action):
-            reward -= switch_cost
+            raw_reward -= self.config['switch_cost']
 
-        self.last_action = action
-        return observation, reward, bool(done), Truncated, info
+        self.last_action = np.copy(action) if isinstance(action, np.ndarray) else action
+
+        reward = raw_reward / 10
+
+        # # New-needs logic — disabled: self.needs is never 0 after reset, so this never fires.
+        # if np.random.rand() < 0.2:
+        #     if len(inactive) > 0:
+        #         idx = np.random.choice(inactive)
+        #         if self.needs[idx] == 0:
+        #             self._declare_need(idx)
+
+        done = bool(np.all(self.progress >= self.needs))
+        if done:
+            reward += 0.0002 * (self.config['max_episode_time'] - self.current_time) ** 2
+
+        truncated = self.current_time >= self.config['max_episode_time']
+
+        info = {
+            "JFI_delay": float(jfi_delay),
+            "urgency_thr": float(urgency_thr),
+            "min_progress": float(min_progress),
+            "total_thr": float(total_thr),
+        }
+
+        return self._get_observation(), reward, done, truncated, info
 
     def _declare_need(self, user_idx):
-        self.needs[user_idx] = 10
+        self.needs[user_idx] = MAX_NEED
 
     def _serve_user(self, user_idx):
-        throughput = 0
         if self.sinr[user_idx] > self.sinr_threshold_linear:
-            throughput = self.config['bandwidth'] * np.log2(1 + self.sinr[user_idx]) * self.config['time_interval']
+            cap = self.config['bandwidth'] * np.log2(1 + self.sinr[user_idx]) * self.config['time_interval']
+            cap = min(cap, self.needs[user_idx] - self.progress[user_idx])
+            self.progress[user_idx] += cap
             self.delay[user_idx] = 0
-            if (self.progress[user_idx] + throughput > self.needs[user_idx]):
-                throughput = self.needs[user_idx] - self.progress[user_idx]
-            self.progress[user_idx] += throughput
-        return throughput
+            return cap
+        return 0.0
 
     def _calculate_sinr(self, selected_users):
-        Noise_level_db = calculate_noise_level_db(self.config['bandwidth'])
-        # Initialize arrays with 0.0 Linear Power (Watts)
+        noise_db = calculate_noise_level_db(self.config['bandwidth'])
         signals = np.zeros(self.num_users)
         interferences = np.zeros(self.num_users)
 
-        for array_idx, user_idx in enumerate(selected_users):
-            user_location = self.locations[user_idx]
-            direction = self._calculate_direction(user_location)
-
-            other_user_indices = [u for i, u in enumerate(selected_users) if i != array_idx and u != user_idx]
-
-            RuserUAV = np.linalg.norm(self.uav_position - user_location)
+        for array_idx, uid in enumerate(selected_users):
+            loc = self.locations[uid]
+            theta, phi = self._calculate_direction(loc)
+            R = np.linalg.norm(self.uav_position - loc)
             D, PhaseTable = self.array_configs[array_idx]
 
-            if other_user_indices:
-                interference_directions, interference_distances = self._calculate_interference_directions(other_user_indices)
-                Signal_db, InterferencedB = pert2d_null_multi(D, PhaseTable, direction[0], direction[1], RuserUAV,
-                                                      interference_directions[:, 0], interference_directions[:, 1], interference_distances, Noise_level_db)
-                Interference_linear = 10**(InterferencedB/10)
+            others = [u for i, u in enumerate(selected_users) if i != array_idx and u != uid]
 
-                # Accumulate signal power (Linear)
-                signals[user_idx] += 10**(Signal_db/10)
-
-                # Accumulate interference power (Linear)
-                for idx, int_user_in_list in enumerate(other_user_indices):
-                    interferences[int_user_in_list] += Interference_linear[idx]
+            if others:
+                int_dirs, int_dists = self._calculate_interference_directions(others)
+                sig_db, int_db = pert2d_null_multi(
+                    D, PhaseTable, theta, phi, R,
+                    int_dirs[:, 0], int_dirs[:, 1], int_dists, noise_db
+                )
+                signals[uid] += 10 ** (sig_db / 10)
+                for k, int_uid in enumerate(others):
+                    interferences[int_uid] += 10 ** (int_db[k] / 10)
             else:
-                phBest = phase_code_finder(D, PhaseTable, direction[0], direction[1])
-                Signal_db = find_gain_of_tphi(direction[0], direction[1], phBest, D) - total_path_loss(RuserUAV)
-                signals[user_idx] += 10**(Signal_db/10)
+                ph = phase_code_finder(D, PhaseTable, theta, phi)
+                sig_db = find_gain_of_tphi(theta, phi, ph, D) - total_path_loss(R)
+                signals[uid] += 10 ** (sig_db / 10)
 
-        noise_linear = 10**(Noise_level_db/10)
-        self.sinr = signals / (interferences + noise_linear)
+        noise_lin = 10 ** (noise_db / 10)
+        self.sinr = signals / (interferences + noise_lin)
 
     def _calculate_direction(self, user_location):
-        diff_x, diff_y = user_location - self.uav_position
-        distance = np.sqrt(diff_x ** 2 + diff_y ** 2 + self.config['uav_height'] ** 2)
-        theta = np.degrees(np.arccos(self.config['uav_height'] / distance))
-        phi = np.degrees(np.arctan2(diff_y, diff_x))
+        dx, dy = user_location - self.uav_position
+        dist_3d = np.sqrt(dx ** 2 + dy ** 2 + self.config['uav_height'] ** 2)
+        theta = np.degrees(np.arccos(self.config['uav_height'] / dist_3d))
+        phi = np.degrees(np.arctan2(dy, dx))
         return theta, phi
 
     def _calculate_interference_directions(self, user_indices):
-        directions = []
-        distances = []
-        for user_idx in user_indices:
-            user_location = self.locations[user_idx]
-            direction = self._calculate_direction(user_location)
-            distance = np.linalg.norm(np.append(user_location - self.uav_position, self.config['uav_height']))
-            directions.append(direction)
-            distances.append(distance)
-        return np.array(directions), np.array(distances)
+        dirs, dists = [], []
+        for uid in user_indices:
+            loc = self.locations[uid]
+            dirs.append(self._calculate_direction(loc))
+            dists.append(np.linalg.norm(np.append(loc - self.uav_position, self.config['uav_height'])))
+        return np.array(dirs), np.array(dists)
 
     def _update_uav_location(self, selected_users):
-        # Move towards centroid of optimal positions for selected users
-        optimal_locations = []
-        unique_users = np.unique(selected_users)
-        for user_idx in unique_users:
-            optimal_location = self._calculate_optimal_location(user_idx)
-            optimal_locations.append(optimal_location)
-
-        if optimal_locations:
-            avg_optimal_location = np.mean(optimal_locations, axis=0)
-            direction = avg_optimal_location - self.uav_position
-            if np.linalg.norm(direction) > 1e-6:
-                direction = direction / np.linalg.norm(direction)
-            self.uav_position += direction * self.config['uav_speed'] * self.config['time_interval']
-
-        user_distance = np.linalg.norm(self.uav_position - self.locations, axis=1)
-        # Mean distance of ACTIVE users? Or selected?
-        # Env used selected.
-        return np.mean(user_distance[unique_users]) if len(unique_users)>0 else 0
+        targets = [self._calculate_optimal_location(uid) for uid in np.unique(selected_users)]
+        if targets:
+            avg = np.mean(targets, axis=0)
+            d = avg - self.uav_position
+            norm = np.linalg.norm(d)
+            if norm > 1e-6:
+                self.uav_position += (d / norm) * self.config['uav_speed'] * self.config['time_interval']
 
     def _calculate_optimal_location(self, user_idx):
-        gain_ratio = self.bts_gain / self.uav_user_gain
-        user_location = self.locations[user_idx]
-        optimal_distance_ratio = np.sqrt(gain_ratio)
-        user_distance = np.linalg.norm(self.uav_position - user_location)
-        optimal_user_distance = user_distance / optimal_distance_ratio
-
-        direction = user_location - self.uav_position
-        if np.linalg.norm(direction) > 1e-6:
-            direction = direction / np.linalg.norm(direction)
-
-        optimal_location = user_location - direction * optimal_user_distance
-        return optimal_location
+        loc = self.locations[user_idx]
+        d = loc - self.uav_position
+        norm = np.linalg.norm(d)
+        if norm < 1e-6:
+            return loc
+        optimal_dist = norm / np.sqrt(self.bts_gain / self.uav_user_gain)
+        return loc - (d / norm) * optimal_dist
 
     def get_action_mask(self):
-        # For MultiDiscrete, we return a list of masks, one for each dimension.
-        # Each dimension corresponds to an antenna array, which can select any user.
-        # The mask for each array is the same: valid users (active needs).
-        user_mask = (self.needs > self.progress)
-        # Duplicate this mask for each array
-        return [user_mask] * self.num_arrays
+        user_mask = (self.needs > self.progress).astype(bool)
+        if self.config.get('operation_mode', 'multi') == 'single':
+            # Discrete action space: mask shape = (num_users,)
+            return user_mask
+        else:
+            # MultiDiscrete action space: flat mask shape = (num_users * num_arrays,)
+            # sb3_contrib expects masks for all dimensions concatenated into one 1-D array.
+            return np.tile(user_mask, self.num_arrays)
 
     def _get_observation(self):
-        needs_progress = self.needs - self.progress
-        user_satisfied = needs_progress <= 0
-        needs_progress[user_satisfied] = 0
+        needs_remaining = np.maximum(self.needs - self.progress, 0.0)
+        user_satisfied = needs_remaining <= 0
         distance = np.linalg.norm(self.locations - self.uav_position, axis=1)
 
-        user_directions = np.zeros((self.num_users,))
-        for user_idx in range(self.num_users):
-            user_location = self.locations[user_idx]
-            direction = self._calculate_direction(user_location)
-            user_directions[user_idx] = direction[1]
-        user_directions[user_satisfied] = 0
+        directions = np.zeros(self.num_users)
+        for i in range(self.num_users):
+            _, phi = self._calculate_direction(self.locations[i])
+            directions[i] = phi
+        directions[user_satisfied] = 0.0
+
+        remaining_time = np.clip(
+            [(self.config['max_episode_time'] - self.current_time) / self.config['max_episode_time']],
+            0.0, 1.0
+        ).astype(np.float64)
 
         return {
-            'needs': needs_progress / MAX_NEED,
-            'directions': user_directions / 360,
-            'distance': distance / self.config['max_range'] / 2,
-            'user_satisfied': user_satisfied
+            'needs':          (needs_remaining / MAX_NEED).astype(np.float64),
+            'directions':     (directions / 360.0).astype(np.float64),
+            'distance':       (distance / (self.config['max_range'] * 2)).astype(np.float64),
+            'user_satisfied': user_satisfied.astype(np.int8),
+            'remaining_time': remaining_time,
         }

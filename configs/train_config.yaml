@@ -1,18 +1,18 @@
-
 policy_kwargs:
   net_arch:
-    pi: [512, 256, 128]
-    vf: [512, 128, 64]
+    pi: [256, 128]
+    vf: [128, 64]
   optimizer_kwargs:
-    weight_decay: 0.0001
+    weight_decay: 0.00001
 
-n_steps: 1024
-batch_size: 64
+n_envs: 4            # parallel environments (multiplies batch diversity)
+n_steps: 2048        # steps per env per rollout; effective batch = n_steps * n_envs = 8192
+batch_size: 256      # mini-batch size for gradient updates
 learning_rate: 0.0003
 clip_range: 0.2
-ent_coef: 0.01
+ent_coef: 0.02       # slightly higher entropy → more exploration early
 vf_coef: 0.5
 gae_lambda: 0.95
 gamma: 0.99
 n_epochs: 10
-total_timesteps: 1024
+total_timesteps: 1000000
