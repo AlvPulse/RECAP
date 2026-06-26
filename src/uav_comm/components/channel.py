@@ -29,8 +29,10 @@ def los_probability_uav(d, h_uav, h_user=1.5, a=12.08, b=0.11):
     P_LoS = 1.0 / (1.0 + a * np.exp(-b * (theta_deg - a)))
     return np.clip(P_LoS, 0.0, 1.0)
 
-def total_path_loss(d_n_m, h_n=50, h_m=1.5, f_c=28, fading=True):
-    # Parameters
+def total_path_loss(d_n_m, h_n=50, h_m=1.5, f_c=28, fading=False):
+    # fading=False by default for training stability.
+    # When re-enabling stochastic fading, use: 10*log10(h²) where h ~ Rayleigh(σ=1/√2)
+    # so that mean channel power E[h²] = 1 (0 dB shift on average).
     zeta_params = (38.77, 16.7, 18.2)
     eta_params = (36.85, 30, 18.9)
 
@@ -41,13 +43,8 @@ def total_path_loss(d_n_m, h_n=50, h_m=1.5, f_c=28, fading=True):
     total_PL = P_LoS * PL_LoS + (1 - P_LoS) * PL_NLoS
 
     if fading:
-        fading_gain = rayleigh_fading()
-        # total_PL_with_fading = total_PL + 1.5 * np.log10(fading_gain) # 1.5? Original code had this.
-        # Usually fading is additive in dB or multiplicative in linear.
-        # Original: total_PL_with_fading = total_PL + 1.5 * np.log10(fading_gain)
-        # Note: 10*log10(rayleigh^2) is standard.
-        # But let's stick to original logic for now to maintain parity.
-        total_PL_with_fading = total_PL + 1.5 * np.log10(fading_gain)
-        return total_PL_with_fading
+        h = rayleigh_fading()                          # amplitude, Rayleigh(scale=1/√2)
+        fading_db = 10 * np.log10(max(h ** 2, 1e-12)) # power in dB; subtract from path loss (gain reduces loss)
+        return total_PL - fading_db
 
     return total_PL

@@ -4,47 +4,88 @@ import numpy as np
 MIN_PROGRESS = 1e-4
 MAX_NEED = 10
 
-def calculate_reward_function(throughput, mean_distance, delay, progress, needs, active_users, episode_time):
-    # Constants
-    time_bonus_coeff = 0.0002
-    MAX_EPISODE_TIME = 30 # TODO: Pass this in config
 
-    closeness_reward = 10 / (mean_distance + 10)
+def calculate_reward_function(throughputs_per_user, delay, progress, needs, active_users, current_time, max_episode_time):
+    """
+    Reward design rationale
+    -----------------------
+    The previous JFI-on-state reward had a credit-assignment problem: it told the agent
+    how fair the CURRENT STATE was, but not which action this step was responsible for.
+    The agent could not learn "I chose user 3 because they were falling behind."
 
-    user_weight = 1
-    half_life_weight = 0.5
-    throughput_weight = 0.2
+    New design uses three components, each with a distinct role:
 
-    half_life_users = (needs / 2 > progress)
-    n_half_life = np.sum(half_life_users)
-    n_active = np.sum(active_users)
+    1. Urgency-weighted throughput  (primary, immediate, action-correlated)
+       Weight_i = (delay_i + 1) × remaining_deficit_i, normalised to sum=1.
+       This directly rewards serving the most-neglected user THIS step.
+       A user who has waited 8 steps with 90% remaining gets 8× the reward credit
+       compared to a freshly-served user with 10% remaining.
+       → Implements an LWDF-inspired (Largest Weighted Delay First) per-step objective.
 
-    episode_reward = (
-        user_weight / (n_active + 0.5) +
-        half_life_weight / (n_half_life + 1)
+    2. Min-progress ratio  (secondary, state-level max-min fairness)
+       = min(progress_i / needs_i) over active users.
+       Ranges [0, 1]. Directly measures how well the WORST-OFF user is doing.
+       Complements urgency weighting: even if urgency rewards were given, this
+       catches episodes where the agent still neglected one user.
+
+    3. Delay-JFI  (tertiary, state-level delay equity)
+       Kept as a softer secondary signal. Lower weight than before.
+
+    4. Progress reward  (completion incentive)
+       Increases as users finish. Ensures the agent still aims to complete the episode.
+    """
+    n_active = int(np.sum(active_users))
+    n_half_life = int(np.sum((needs / 2) > progress))
+
+    # --- 1. Urgency-weighted throughput ---
+    remaining = np.maximum(needs - progress, 0.0)
+    raw_urgency = (delay + 1.0) * remaining
+    raw_urgency[~active_users] = 0.0
+    urgency_sum = raw_urgency.sum()
+    if urgency_sum > 1e-6:
+        urgency = raw_urgency / urgency_sum
+    else:
+        urgency = np.zeros_like(raw_urgency)
+
+    urgency_weighted_thr = float(np.dot(throughputs_per_user, urgency))
+    total_thr = float(np.sum(throughputs_per_user))
+
+    # --- 2. Min-progress ratio (max-min fairness) ---
+    if n_active > 0:
+        prog_ratios = progress[active_users] / np.maximum(needs[active_users], 1e-6)
+        min_progress_ratio = float(np.min(prog_ratios))
+    else:
+        min_progress_ratio = 1.0
+
+    # --- 3. Delay JFI (state-level equity signal, lower weight than before) ---
+    if n_active > 1:
+        d = delay[active_users]
+        jfi_delay = float((np.sum(d) ** 2) / (n_active * np.sum(d ** 2) + 1e-6))
+    else:
+        jfi_delay = 1.0
+
+    # --- 4. Progress reward ---
+    progress_reward = 1.0 / (n_active + 0.5) + 0.5 / (n_half_life + 1)
+
+    # Weights chosen so components contribute proportionately:
+    # urgency_weighted_thr ~ 0.1-0.7 Gbits → ×4 → 0.4-2.8
+    # total_thr ~ 0.3-2.0 Gbits → ×0.5 → 0.15-1.0
+    # min_progress_ratio ~ [0,1] → ×2 → 0-2
+    # jfi_delay ~ [0,1] → ×0.5 → 0-0.5
+    # progress_reward ~ 0.2-2.5 → ×0.2 → 0.04-0.5
+    raw_reward = (
+        4.0 * urgency_weighted_thr
+        + 0.5 * total_thr
+        + 2.0 * min_progress_ratio
+        + 0.5 * jfi_delay
+        + 0.2 * progress_reward
     )
 
-    sinr_reward = (throughput**3) * throughput_weight
+    return raw_reward, jfi_delay, urgency_weighted_thr, min_progress_ratio, total_thr
 
-    # JFI for Delay
-    sum_delay = np.sum(delay[active_users])
-    sum_delay_squared = np.sum(delay[active_users] ** 2)
-    jfi_delay = (sum_delay ** 2) / (n_active * sum_delay_squared + 1e-6)
-
-    # Proportional Fairness
-    proportional_fairness_reward = np.sum(np.log(np.maximum(progress[active_users] / MAX_NEED, MIN_PROGRESS)))
-
-    alpha = 2
-    beta = 0.1
-
-    raw_reward = sinr_reward - alpha * jfi_delay + beta * proportional_fairness_reward - episode_reward
-
-    # Stateful normalization would need to be handled by a class or external tracker.
-    # For now, return raw components.
-
-    return raw_reward, jfi_delay, sinr_reward, proportional_fairness_reward, episode_reward
 
 class RewardTracker:
+    """Running normaliser — unused while VecNormalize handles reward normalisation externally."""
     def __init__(self):
         self.meanR = 0
         self.varR = 1
@@ -56,6 +97,4 @@ class RewardTracker:
         self.meanR += delta / self.countR
         delta2 = reward - self.meanR
         self.varR = ((self.countR - 1) * self.varR + delta * delta2) / self.countR
-        norm_rew = (reward - self.meanR) / (np.sqrt(self.varR) + 1e-8)
-        norm_rew = np.clip(norm_rew, -10, +10)
-        return norm_rew
+        return np.clip((reward - self.meanR) / (np.sqrt(self.varR) + 1e-8), -10, 10)
