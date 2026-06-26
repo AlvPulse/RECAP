@@ -44,3 +44,25 @@ Currently, the Reinforcement Learning agent (MaskablePPO) exhibits poorer perfor
 - **Environment Wrapper Ordering and the Monitor:** If standard Gym wrappers like `Monitor` (necessary for logging episode metrics to MLflow) are placed incorrectly around the `ActionMasker`, the agent might fail to bypass the wrapper layers to correctly invoke `env.unwrapped.get_action_mask()`. This leads to silent failures where invalid actions aren't actually masked during training.
 - **Reward Engineering Complexity:** The reward function has been heavily engineered and attempts to simultaneously optimize for urgency (LWDF-inspired throughput), max-min fairness (minimum progress ratio), equity (Jain's Fairness Index for delay), and episode completion bonuses. Such dense, multi-objective scalarized rewards are notoriously difficult for PPO to optimize effectively without extremely careful coefficient tuning and potentially much longer training time.
 - **Insufficient Training Timesteps:** Training is currently configured for a limited number of timesteps (e.g. 1024 to 1M). Given the complex, continuous state space (users' locations, SINR, dynamic path-loss) and the large multi-discrete action space, the agent likely requires tens of millions of interactions to discover a policy that outperforms the highly specialized deterministic baselines.
+
+## 6. RL as a Mitigation for Single-Bit Panel Hardware Limitations
+The fundamental motivation for employing Reinforcement Learning (RL) in this project stems directly from the hardware limitations of the simulated antenna arrays. The UAV is equipped with **single-bit phase shifters** (panels that can only shift phase by 0° or 180°).
+
+**The Hardware Problem:**
+Unlike high-resolution or continuous phase shifters, single-bit panels suffer from significant quantization errors. This results in:
+- **Poor Beamforming Gain:** The main lobe directed at the intended user is sub-optimal and weaker.
+- **Inadequate Null-Forming:** It is exceptionally difficult to steer deep, precise nulls toward non-intended users, leading to high inter-user interference.
+
+**How RL/MARL Solves This:**
+Deterministic or heuristic scheduling algorithms (like Greedy or FCFS) select users based purely on their data needs or physical proximity. They completely ignore the spatial correlation between the selected users. If two closely situated users are selected simultaneously by different arrays, the single-bit panels cannot suppress the resulting interference, and the Signal-to-Interference-plus-Noise Ratio (SINR) collapses.
+
+Reinforcement Learning acts as a powerful *spatial scheduler*. By observing the users' relative angles and distances (`directions` and `distance` in the observation space) and experiencing the simulated SINR penalties in the environment, the RL agent learns a policy to:
+1. **Spatially Multiplex Intelligently:** It learns to concurrently serve groups of users who are geographically separated (orthogonal channels) so that the inherent high sidelobes of single-bit beamforming do not point at active receivers.
+2. **Avoid Destructive Interference:** It avoids scheduling users who are angularly close, completely sidestepping the null-forming limitations of the hardware.
+
+**Does this repository currently prove it?**
+**Conceptually, yes. Empirically, not yet.**
+The environment meticulously simulates the exact physical reality of single-bit beamforming (via `error_calculator` and quantization logic in `antenna.py`), and the state space provides the agent with all necessary spatial information.
+However, as analyzed in Section 5, the current RL agent underperforms against the baselines. To definitively *prove* that RL finds the optimal user combinations that maximize SINR despite single-bit limitations, the agent requires:
+- Extensive hyperparameter tuning.
+- Significantly longer training times (millions of steps) to fully map the complex, non-linear relationship between user angles, single-bit phase quantization, and resulting interference.
