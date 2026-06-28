@@ -13,7 +13,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 sys.path.append(os.getcwd())
 
 from src.uav_comm.envs.core import UAVEnv
-from src.uav_comm.utils.callbacks import MLflowCallback
+from src.uav_comm.utils.callbacks import MLflowCallback, VecNormalizeCheckpointCallback
 
 
 def load_train_config(config_path="configs/train_config.yaml"):
@@ -65,7 +65,7 @@ def train():
             norm_obs=True,
             norm_reward=True,
             clip_obs=10.0,
-            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time'],
+            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs'],
         )
 
         print("Initialising MaskablePPO...")
@@ -89,14 +89,20 @@ def train():
         print(f"Training for {total_steps} timesteps across {n_envs} envs "
               f"({total_steps // n_envs} steps each)...")
 
+        ckpt_freq = max(50_000 // n_envs, 1)
         checkpoint_cb = CheckpointCallback(
-            save_freq=max(50_000 // n_envs, 1),
+            save_freq=ckpt_freq,
+            save_path="models/checkpoints/",
+            name_prefix="ppo_uav",
+        )
+        vecnorm_cb = VecNormalizeCheckpointCallback(
+            save_freq=ckpt_freq,
             save_path="models/checkpoints/",
             name_prefix="ppo_uav",
         )
         mlflow_cb = MLflowCallback()
 
-        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, mlflow_cb])
+        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, vecnorm_cb, mlflow_cb])
 
         print("Saving model...")
         os.makedirs("models", exist_ok=True)

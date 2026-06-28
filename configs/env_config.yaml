@@ -10,4 +10,9 @@ bandwidth: 0.35
 sinr_threshold_db: 3
 switch_cost: 0.25
 operation_mode: multi   # 'single': all arrays → one user | 'multi': each array independent
+# UAV transmitter power and user receive gain (for link budget).
+# 43 dBm (20 W) models a research-grade drone relay at 28 GHz overcoming severe NLoS path loss.
+# Lower to 33 dBm (2 W) for battery-constrained indoor scenarios.
+tx_power_dbm: 43
+rx_gain_dbi: 0
 

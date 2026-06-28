@@ -62,25 +62,37 @@ def run_baseline_episode(env, action_fn, seed):
     }
 
 
-def run_rl_episode(model, vec_env, raw_env, seed):
-    """Run one RL episode. Uses normalised VecEnv for inference, raw env for metrics."""
+def run_rl_episode(model, vec_env, seed, max_steps=120):
+    """Run one RL episode with action masking. Returns metrics dict."""
     obs = vec_env.reset()
-    done = False
+    inner = vec_env.envs[0].env   # ActionMasker → UAVEnv
+    inner.reset(seed=seed)
+    obs = vec_env.reset()
+
     total_reward = 0.0
-
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, _ = vec_env.step(action)
+    last_progress = np.zeros(inner.num_users)
+    last_needs = np.ones(inner.num_users) * 10.0
+    last_time = 0
+    all_done = False
+    for _ in range(max_steps):
+        # Snapshot BEFORE step — DummyVecEnv auto-resets on done=True, wiping inner.progress.
+        last_progress = inner.progress.copy()
+        last_needs = inner.needs.copy()
+        last_time = getattr(inner, 'current_time', 0)
+        action_masks = np.array([e.env.get_action_mask() for e in vec_env.envs])
+        action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+        obs, reward, done_arr, _ = vec_env.step(action)
         total_reward += float(reward[0])
+        if done_arr[0]:
+            all_done = True
+            break
 
-    # Extract metrics from the underlying raw env
-    inner = vec_env.envs[0].env  # ActionMasker → UAVEnv
     n_users = inner.num_users
-    served = np.sum(inner.progress >= inner.needs)
+    served = np.sum(last_progress >= last_needs)
     completion_rate = served / n_users
-    prog_ratios = inner.progress / np.maximum(inner.needs, 1e-6)
+    prog_ratios = last_progress / np.maximum(last_needs, 1e-6)
     fairness = _jfi(prog_ratios)
-    completion_time = inner.current_time if served == n_users else inner.config['max_episode_time']
+    completion_time = last_time if all_done else inner.config['max_episode_time']
 
     return {
         'reward': total_reward,
@@ -106,40 +118,97 @@ def evaluate_final():
     bl = MultiUserBaselines(raw_env)
 
     # ── RL setup ──────────────────────────────────────────────────────────────
-    model_path = "models/ppo_multi_user_latest"
-    stats_path = "models/vec_normalize_latest.pkl"
-    rl_available = os.path.exists(model_path + ".zip") and os.path.exists(stats_path)
-
+    # Prefer the latest model if it has a companion VecNormalize, else fall back to
+    # the best available checkpoint (largest step count with companion vecnorm pkl).
     def mask_fn(env):
         return env.get_action_mask()
 
-    if rl_available:
-        vec_env = DummyVecEnv([lambda: ActionMasker(UAVEnv(config=env_config), mask_fn)])
-        vec_env = VecNormalize.load(stats_path, vec_env)
-        vec_env.training = False
-        vec_env.norm_reward = False
-        rl_model = MaskablePPO.load(model_path, env=vec_env)
-        print(f"Loaded RL model from {model_path}\n")
-    else:
-        print("WARNING: No trained model found — RL column will be skipped.\n"
-              "         Run train_multi_user.py first.\n")
+    def _make_rl_env():
+        return ActionMasker(UAVEnv(config=env_config), mask_fn)
+
+    def _find_best_checkpoint():
+        """Return sorted list of (model_path, vecnorm_path) candidates.
+
+        Priority: has companion vecnorm pkl first (accurate eval), then largest step count.
+        Caller should try each in order and break on first successful load.
+        """
+        ckpt_dir = "models/checkpoints"
+        if not os.path.exists(ckpt_dir):
+            return []
+        pairs = []
+        for f in os.listdir(ckpt_dir):
+            if not f.endswith('.zip') or 'vecnorm' in f:
+                continue
+            vn = f.replace('_steps.zip', '_steps_vecnorm.pkl')
+            vn_path = os.path.join(ckpt_dir, vn) if os.path.exists(os.path.join(ckpt_dir, vn)) else None
+            try:
+                steps = int(f.replace('ppo_uav_', '').replace('_steps.zip', ''))
+            except ValueError:
+                continue
+            pairs.append((steps, os.path.join(ckpt_dir, f), vn_path))
+        # Sort: has vecnorm first, then step count descending
+        pairs.sort(key=lambda x: (x[2] is not None, x[0]), reverse=True)
+        return [(p, vn) for _, p, vn in pairs]
+
+    # Try loading best model
+    final_model = "models/ppo_multi_user_latest"
+    final_vn    = "models/vec_normalize_latest.pkl"
+    rl_available = False
+    vec_env = None
+    rl_model = None
+
+    if os.path.exists(final_model + ".zip") and os.path.exists(final_vn):
+        try:
+            vec_env = DummyVecEnv([_make_rl_env])
+            vec_env = VecNormalize.load(final_vn, vec_env)
+            vec_env.training = False; vec_env.norm_reward = False
+            rl_model = MaskablePPO.load(final_model, env=vec_env)
+            rl_available = True
+            print(f"Loaded final RL model: {final_model}\n")
+        except Exception as e:
+            print(f"Could not load final model: {e}")
+
+    if not rl_available:
+        candidates = _find_best_checkpoint()
+        if not candidates:
+            print("WARNING: No RL checkpoints found. Run train_multi_user.py first.\n")
+        for ck_model, ck_vn in candidates:
+            try:
+                vec_env = DummyVecEnv([_make_rl_env])
+                if ck_vn:
+                    vec_env = VecNormalize.load(ck_vn, vec_env)
+                    vec_env.training = False; vec_env.norm_reward = False
+                else:
+                    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0,
+                        norm_obs_keys=['needs','directions','distance','remaining_time','sinr_obs'])
+                rl_model = MaskablePPO.load(ck_model, env=vec_env)
+                rl_available = True
+                vn_note = "(with saved VecNorm)" if ck_vn else "(fresh VecNorm — approximate)"
+                print(f"Loaded RL checkpoint: {ck_model} {vn_note}\n")
+                break
+            except Exception as e:
+                print(f"  Skipping {ck_model}: {e}")
+
+    if not rl_available:
+        print("WARNING: No RL model found — RL column will be skipped. Run train_multi_user.py first.\n")
 
     # ── Algorithm catalogue ────────────────────────────────────────────────────
     # Each entry: (label, category, action_fn)
-    # action_fn must be called AFTER env.reset() so baselines see fresh state.
     algorithms = [
         # Single-user baselines (all arrays → one user)
-        ("S-Random",   "Single", lambda: bl.single_random()),
-        ("S-FCFS",     "Single", lambda: bl.single_fcfs()),
-        ("S-Greedy",   "Single", lambda: bl.single_greedy()),
-        ("S-RR",       "Single", lambda: bl.single_round_robin()),
-        ("S-PF",       "Single", lambda: bl.single_proportional_fair()),
+        ("S-Random",   "Single",  lambda: bl.single_random()),
+        ("S-FCFS",     "Single",  lambda: bl.single_fcfs()),
+        ("S-Greedy",   "Single",  lambda: bl.single_greedy()),
+        ("S-RR",       "Single",  lambda: bl.single_round_robin()),
+        ("S-PF",       "Single",  lambda: bl.single_proportional_fair()),
         # Multi-user baselines (each array independent)
-        ("M-Random",   "Multi",  lambda: bl.multi_random()),
-        ("M-FCFS",     "Multi",  lambda: bl.multi_fcfs()),
-        ("M-Greedy",   "Multi",  lambda: bl.multi_greedy()),
-        ("M-RR",       "Multi",  lambda: bl.multi_round_robin()),
-        ("M-PF",       "Multi",  lambda: bl.multi_proportional_fair()),
+        ("M-Random",   "Multi",   lambda: bl.multi_random()),
+        ("M-FCFS",     "Multi",   lambda: bl.multi_fcfs()),
+        ("M-Greedy",   "Multi",   lambda: bl.multi_greedy()),
+        ("M-RR",       "Multi",   lambda: bl.multi_round_robin()),
+        ("M-PF",       "Multi",   lambda: bl.multi_proportional_fair()),
+        # Angular-separation-aware greedy (strongest non-RL multi baseline)
+        ("M-Angular",  "Multi",   lambda: bl.multi_angular_greedy()),
     ]
 
     results = {}
@@ -159,7 +228,7 @@ def evaluate_final():
         print("  Evaluating RL (MaskablePPO) ...")
         rl_eps = []
         for i in range(N_EPISODES):
-            ep = run_rl_episode(rl_model, vec_env, raw_env, seed=i)
+            ep = run_rl_episode(rl_model, vec_env, seed=i)
             rl_eps.append(ep)
         results["RL-PPO"] = rl_eps
 
@@ -192,7 +261,7 @@ def evaluate_final():
         ('completion_time', 'Completion Time (s)', gs[1, 1]),
     ]
 
-    colors = ['#4C72B0'] * 5 + ['#DD8452'] * 5 + ['#55A868'] * 1  # single / multi / RL
+    colors = ['#4C72B0'] * 5 + ['#DD8452'] * 6 + ['#55A868'] * 1  # single(5) / multi(6) / RL(1)
 
     for metric, ylabel, pos in metric_info:
         ax = fig.add_subplot(pos)

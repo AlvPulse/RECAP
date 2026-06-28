@@ -38,16 +38,17 @@ class UAVEnv(gym.Env):
         self.num_elements_per_array = self.config['num_elements_per_array']
 
         self.bts_gain = 10 ** (50 / 10) * 10 ** (10 / 10)
-        self.uav_user_gain = 10 ** (24 / 10) * 10 ** (0 / 10)
+        tx_dbm  = self.config.get('tx_power_dbm', 43)   # UAV transmit power (dBm)
+        rx_dbi  = self.config.get('rx_gain_dbi', 0)     # User receive antenna gain (dBi)
+        # uav_user_gain in linear mW; divided by 1000 when computing effective noise (→ W)
+        self.uav_user_gain = 10 ** ((tx_dbm + rx_dbi) / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
         self.array_configs = [array_locs(self.num_elements_per_array) for _ in range(self.num_arrays)]
 
         if self.config['operation_mode'] == 'single':
-            # Mode a: one discrete user choice, all arrays point there
             self.action_space = spaces.Discrete(self.num_users)
         else:
-            # Mode b: each array independently picks a user
             self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
 
         self.observation_space = spaces.Dict({
@@ -56,6 +57,9 @@ class UAVEnv(gym.Env):
             'distance':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
             'user_satisfied': spaces.MultiBinary(self.num_users),
             'remaining_time': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float64),
+            # Normalised SINR from the previous step: direct feedback on null-forming quality.
+            # log2(1+SINR)/10 maps SINR=[0,500] → [0,0.9]; zero for unsatisfied/unserved users.
+            'sinr_obs':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
         })
 
         self.reset()
@@ -82,7 +86,7 @@ class UAVEnv(gym.Env):
     def step(self, action):
         self.current_time += self.config['time_interval']
 
-        # Resolve per-array user assignments from action
+        # Resolve per-array user assignments
         if self.config['operation_mode'] == 'single':
             uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
             selected_users = np.full(self.num_arrays, uid, dtype=int)
@@ -107,19 +111,18 @@ class UAVEnv(gym.Env):
 
         self._update_uav_location(selected_users)
 
-        raw_reward, jfi_delay, urgency_thr, min_progress, total_thr = calculate_reward_function(
-            throughputs_per_user, self.delay, self.progress, self.needs,
-            active_users, self.current_time, self.config['max_episode_time']
+        raw_reward, sinr_quality, urgency_thr, min_progress, completion_rew = calculate_reward_function(
+            throughputs_per_user, self.sinr, self.sinr_threshold_linear,
+            self.delay, self.progress, self.needs, active_users
         )
 
-        # Safety net: penalise targeting already-satisfied users.
-        # Action masking should prevent this; penalty is at raw scale (consistent with /10 below).
+        # Safety net: penalise targeting already-satisfied users (masking should prevent this).
         inactive = np.where(~active_users)[0]
         wrong_count = int(np.sum(np.isin(selected_users, inactive)))
         if wrong_count > 0:
             raw_reward -= wrong_count * 2
 
-        # Switch cost applied at raw scale so it stays proportionate after /10
+        # Switch cost applied at raw scale (consistent with /10 below)
         if self.last_action is not None and not np.array_equal(action, self.last_action):
             raw_reward -= self.config['switch_cost']
 
@@ -141,10 +144,9 @@ class UAVEnv(gym.Env):
         truncated = self.current_time >= self.config['max_episode_time']
 
         info = {
-            "JFI_delay": float(jfi_delay),
-            "urgency_thr": float(urgency_thr),
+            "sinr_quality": float(sinr_quality),
+            "urgency_thr":  float(urgency_thr),
             "min_progress": float(min_progress),
-            "total_thr": float(total_thr),
         }
 
         return self._get_observation(), reward, done, truncated, info
@@ -169,10 +171,20 @@ class UAVEnv(gym.Env):
         for array_idx, uid in enumerate(selected_users):
             loc = self.locations[uid]
             theta, phi = self._calculate_direction(loc)
+            # 2D horizontal distance for signal path loss (consistent with channel model)
             R = np.linalg.norm(self.uav_position - loc)
             D, PhaseTable = self.array_configs[array_idx]
 
-            others = [u for i, u in enumerate(selected_users) if i != array_idx and u != uid]
+            # Deduplicate: each interfering user counted once per array.
+            # Bug fix: when two arrays serve the same interference user (e.g. selected=[0,1,1,2]),
+            # that user would appear twice in `others` without deduplication, causing double-counted
+            # interference power and double null attempts.
+            seen = set()
+            others = []
+            for i, u in enumerate(selected_users):
+                if i != array_idx and u != uid and u not in seen:
+                    others.append(u)
+                    seen.add(u)
 
             if others:
                 int_dirs, int_dists = self._calculate_interference_directions(others)
@@ -188,8 +200,13 @@ class UAVEnv(gym.Env):
                 sig_db = find_gain_of_tphi(theta, phi, ph, D) - total_path_loss(R)
                 signals[uid] += 10 ** (sig_db / 10)
 
-        noise_lin = 10 ** (noise_db / 10)
-        self.sinr = signals / (interferences + noise_lin)
+        # uav_user_gain encodes TX power (dBm) × RX gain (dBi) in linear mW.
+        # signals/interferences are normalised to 1 W TX, so we must divide the
+        # thermal noise by the actual TX power (converted W) to make units consistent.
+        # Without this, SINR ≈ 0 everywhere → zero throughput → no learning signal.
+        p_tx_watts = self.uav_user_gain / 1000.0        # linear mW → W
+        noise_eff  = 10 ** (noise_db / 10) / p_tx_watts # effective noise floor (dimensionless)
+        self.sinr  = signals / (interferences + noise_eff)
 
     def _calculate_direction(self, user_location):
         dx, dy = user_location - self.uav_position
@@ -203,7 +220,9 @@ class UAVEnv(gym.Env):
         for uid in user_indices:
             loc = self.locations[uid]
             dirs.append(self._calculate_direction(loc))
-            dists.append(np.linalg.norm(np.append(loc - self.uav_position, self.config['uav_height'])))
+            # Fix: use 2D horizontal distance, consistent with signal path loss and
+            # los_probability_uav() which expects horizontal distance for elevation angle.
+            dists.append(np.linalg.norm(loc - self.uav_position))
         return np.array(dirs), np.array(dists)
 
     def _update_uav_location(self, selected_users):
@@ -227,11 +246,10 @@ class UAVEnv(gym.Env):
     def get_action_mask(self):
         user_mask = (self.needs > self.progress).astype(bool)
         if self.config.get('operation_mode', 'multi') == 'single':
-            # Discrete action space: mask shape = (num_users,)
             return user_mask
         else:
-            # MultiDiscrete action space: flat mask shape = (num_users * num_arrays,)
-            # sb3_contrib expects masks for all dimensions concatenated into one 1-D array.
+            # sb3_contrib MaskablePPO with MultiDiscrete expects flat array of shape
+            # (sum(nvec),) = (num_users * num_arrays,) — all dimension masks concatenated.
             return np.tile(user_mask, self.num_arrays)
 
     def _get_observation(self):
@@ -250,10 +268,16 @@ class UAVEnv(gym.Env):
             0.0, 1.0
         ).astype(np.float64)
 
+        # Normalised SINR: tells the agent how well null-forming worked last step.
+        # Zero for satisfied users (no longer relevant) and for unserved users (SINR≈0 by model).
+        sinr_obs = np.clip(np.log2(1.0 + self.sinr) / 10.0, 0.0, 1.0).astype(np.float64)
+        sinr_obs[user_satisfied] = 0.0
+
         return {
             'needs':          (needs_remaining / MAX_NEED).astype(np.float64),
             'directions':     (directions / 360.0).astype(np.float64),
             'distance':       (distance / (self.config['max_range'] * 2)).astype(np.float64),
             'user_satisfied': user_satisfied.astype(np.int8),
             'remaining_time': remaining_time,
+            'sinr_obs':       sinr_obs,
         }

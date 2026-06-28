@@ -186,3 +186,44 @@ class MultiUserBaselines:
             served_rates[uid] = inst_rate[uid]
         self._pf_update(set(selected.tolist()), served_rates)
         return selected
+
+    def multi_angular_greedy(self):
+        """
+        Angular-separation-aware greedy: selects num_arrays users maximising
+        pairwise angular separation from the UAV's perspective.
+
+        This is the strongest non-RL baseline for the null-forming system —
+        it directly addresses the same problem the RL is expected to learn.
+        RL should outperform it by also accounting for urgency and SINR history.
+        """
+        active = self._active()
+        K = self.env.num_arrays
+        if len(active) == 0:
+            return np.zeros(K, dtype=int)
+        if len(active) <= K:
+            return np.resize(active, K)
+
+        # Compute azimuth angles (phi) for each user from the UAV
+        azimuths = np.arctan2(
+            self.env.locations[active, 1] - self.env.uav_position[1],
+            self.env.locations[active, 0] - self.env.uav_position[0]
+        )
+
+        # Greedy selection: first pick the highest-urgency user, then iteratively
+        # add the user whose minimum angular distance to already-selected users is maximal.
+        remaining = self.env.needs - self.env.progress
+        first = active[np.argmax(remaining[active])]
+        selected_local = [np.where(active == first)[0][0]]
+
+        while len(selected_local) < K:
+            best_idx, best_sep = -1, -1.0
+            for i in range(len(active)):
+                if i in selected_local:
+                    continue
+                diffs = [abs(azimuths[i] - azimuths[j]) for j in selected_local]
+                min_sep = min(min(d, 2 * np.pi - d) for d in diffs)
+                if min_sep > best_sep:
+                    best_sep, best_idx = min_sep, i
+            selected_local.append(best_idx)
+
+        return active[np.array(selected_local, dtype=int)]

@@ -35,16 +35,37 @@ def db(x):
     return 20 * np.log10(x)
 
 def error_calculator(D, theta, phi, PhaseCode):
-    lambda_wave = 1
-    K = 360 / lambda_wave
+    K = 360
     Phase_wave_in = K * np.sin(np.radians(theta)) * D @ np.array([np.cos(np.radians(phi)), np.sin(np.radians(phi))])
-    ErrorArray = np.mod(PhaseCode.astype(float) - Phase_wave_in, 360)
-    return ErrorArray
+    return np.mod(PhaseCode.astype(float) - Phase_wave_in, 360)
+
+def _error_calculator_batch(D, thetas, phis, PhaseCode):
+    """Vectorized error_calculator for multiple (theta, phi) directions simultaneously.
+    thetas, phis: shape (M,); D: shape (N, 2); returns shape (M, N)."""
+    K = 360
+    st = np.sin(np.radians(thetas))           # (M,)
+    cp = np.cos(np.radians(phis))             # (M,)
+    sp = np.sin(np.radians(phis))             # (M,)
+    # phase_wave_in[m, n] = K * sin(theta_m) * (D[n,0]*cos(phi_m) + D[n,1]*sin(phi_m))
+    proj = D[:, 0][None, :] * cp[:, None] + D[:, 1][None, :] * sp[:, None]  # (M, N)
+    phase_wave_in = K * st[:, None] * proj                                    # (M, N)
+    return np.mod(PhaseCode[None, :].astype(float) - phase_wave_in, 360)
+
+def _gain_batch(thetas, phis, PhaseCode, D):
+    """Gain (dBi) at each of M directions simultaneously. Returns shape (M,)."""
+    err = _error_calculator_batch(D, thetas, phis, PhaseCode)   # (M, N)
+    AF  = np.abs(np.sum(np.exp(1j * np.deg2rad(err)), axis=1))  # (M,)
+    return 20 * np.log10(np.maximum(AF, 1e-300))
 
 def find_gain_of_tphi(theta, phi, PhaseCode, D):
     ErrorArray = error_calculator(D, theta, phi, PhaseCode)
-    Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))
-    return Gain
+    return db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))
+
+def find_gain_of_tphi_n(theta, phi, PhaseCode, D):
+    N = len(PhaseCode)
+    ErrorArray = error_calculator(D, theta, phi, PhaseCode)
+    Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))/2
+    return Gain - db(N)/2
 
 def phase_code_finder(D, PhaseTable, theta, phi):
     PhaseCode1 = PhaseTable[:, 0]
@@ -55,126 +76,97 @@ def phase_code_finder(D, PhaseTable, theta, phi):
     return PhaseCode
 
 def find_gain_of_tphi_i(thetaN, phiN, RN, PhaseCode, D):
-    Interference = np.zeros_like(thetaN).astype(float)
-    for i in range(len(thetaN)):
-        ErrorArray = error_calculator(D, thetaN[i], phiN[i], PhaseCode)
-        Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))/2
-        Interference[i] = Gain - db(4*RN[i]*np.pi/landa)
-    return Interference
+    # Vectorized: all null directions at once
+    GainN = _gain_batch(thetaN, phiN, PhaseCode, D) / 2   # (M,)
+    return GainN - db(4 * RN * np.pi / landa)
 
 def find_most_effective_null_multi(D, theta, phi, thetaN, phiN, WeightN, PhaseCode, MinNumber):
     ErrorArrayT = error_calculator(D, theta, phi, PhaseCode)
     PhaseMat = np.exp(1j * np.deg2rad(ErrorArrayT))
     Rval = np.real(np.sum(PhaseMat))
-    I = np.imag(np.sum(PhaseMat))
+    I    = np.imag(np.sum(PhaseMat))
 
     if Rval == 0 and I == 0:
-        IndAlter = np.random.randint(len(PhaseCode))
-        flag = False
-    else:
-        DeltaG = Rval * np.real(PhaseMat) + I * np.imag(PhaseMat)
-        DeltaNSum = np.zeros_like(DeltaG)
-        for i in range(len(WeightN)):
-            ErrorArrayN = error_calculator(D, thetaN[i], phiN[i], PhaseCode)
-            PhaseMatN = np.exp(1j * np.deg2rad(ErrorArrayN))
-            RvalN = np.real(np.sum(PhaseMatN))
-            IN = np.imag(np.sum(PhaseMatN))
-            DeltaGN = RvalN * np.real(PhaseMatN) + IN * np.imag(PhaseMatN)
-            DeltaNSum += WeightN[i] * DeltaGN
-        DeltaN = DeltaG - DeltaNSum
-        sorted_indices = np.argsort(DeltaN)
-        IndAlter = sorted_indices[MinNumber]
-        flag = DeltaN[sorted_indices[MinNumber]] >= 0
+        return False, np.random.randint(len(PhaseCode))
+
+    DeltaG = Rval * np.real(PhaseMat) + I * np.imag(PhaseMat)   # (N,)
+
+    # Vectorized: compute gradients for all null directions at once
+    errN = _error_calculator_batch(D, thetaN, phiN, PhaseCode)   # (M, N)
+    PhaseMatN = np.exp(1j * np.deg2rad(errN))                     # (M, N)
+    RvalN = np.real(np.sum(PhaseMatN, axis=1))                    # (M,)
+    IN    = np.imag(np.sum(PhaseMatN, axis=1))                    # (M,)
+    DeltaGN = RvalN[:, None] * np.real(PhaseMatN) + IN[:, None] * np.imag(PhaseMatN)  # (M, N)
+    DeltaNSum = WeightN @ DeltaGN                                  # (N,)
+
+    DeltaN = DeltaG - DeltaNSum
+    sorted_indices = np.argsort(DeltaN)
+    IndAlter = sorted_indices[MinNumber]
+    flag = DeltaN[sorted_indices[MinNumber]] >= 0
     return flag, IndAlter
 
-def fom_calc_null_multi(D, PhaseCode, theta0, phi0, thetaN, phiN, RN, Noise_level):
-    Gain0 = find_gain_of_tphi(theta0, phi0, PhaseCode, D) # Note: Env uses find_gain_of_tphi_n in one place, verify?
-    # Original used find_gain_of_tphi_n for Gain0 in fom_calc_null_multi
-    # But find_gain_of_tphi_n divides by 2 and subtracts db(N)/2.
-    # Let's import/define it if needed.
-    # Actually, in Environment.py:
-    # Gain0 = find_gain_of_tphi_n(theta0, phi0, PhaseCode, D)
-    # Let's add that.
-
-    GainArr = np.zeros_like(thetaN)
-    for i in range(len(RN)):
-        GainNull = find_gain_of_tphi(thetaN[i], phiN[i], PhaseCode, D) - db(RN[i])
-        if GainNull < Noise_level:
-            GainNull = Noise_level
-        GainArr[i] = GainNull
+def fom_calc_null_multi_internal(D, PhaseCode, theta0, phi0, thetaN, phiN, RN, Noise_level):
+    Gain0 = find_gain_of_tphi_n(theta0, phi0, PhaseCode, D)
+    # Vectorized: gain at all null directions in one call
+    GainNulls = _gain_batch(thetaN, phiN, PhaseCode, D) - db(RN)  # (M,)
+    GainArr   = np.maximum(GainNulls, Noise_level)
     FoM = Gain0 + np.max(GainArr)
     return FoM, Gain0
 
-def find_gain_of_tphi_n(theta, phi, PhaseCode, D):
-    N = len(PhaseCode)
-    ErrorArray = error_calculator(D, theta, phi, PhaseCode)
-    Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))/2
-    return Gain - db(N)/2
+def fom_calc_null_multi(D, PhaseCode, theta0, phi0, thetaN, phiN, RN, Noise_level):
+    Gain0     = find_gain_of_tphi(theta0, phi0, PhaseCode, D)
+    GainNulls = _gain_batch(thetaN, phiN, PhaseCode, D) - db(RN)  # (M,)
+    GainArr   = np.maximum(GainNulls, Noise_level)
+    FoM = Gain0 + np.max(GainArr)
+    return FoM, Gain0
 
 def pert2d_null_multi(D, PhaseTable, theta, phi, R, thetaN, phiN, RN, Noise_level):
     PhaseCodeStart = phase_code_finder(D, PhaseTable, theta, phi)
-
-    # We need to redefine fom_calc to use find_gain_of_tphi_n as per original code
-    # Redefining fom_calc logic inline or updating fom_calc above
-
-    # Recalc FoM with correct Gain0 function
-    Gain0 = find_gain_of_tphi_n(theta, phi, PhaseCodeStart, D)
-    # ... logic continues from Env
-
-    # Let's stick to porting logic exactly.
-    # fom_calc_null_multi in Env uses find_gain_of_tphi_n
 
     FoMStart, _ = fom_calc_null_multi_internal(D, PhaseCodeStart, theta, phi, thetaN, phiN, RN, Noise_level)
     InterferenceStartdB = find_gain_of_tphi_i(thetaN, phiN, RN, PhaseCodeStart, D)
     WeightsN = 10 ** ((InterferenceStartdB - np.max(InterferenceStartdB)) / 5)
 
-    PhaseCodeAltering = PhaseCodeStart.copy()
-    PhaseCodeBest = PhaseCodeAltering.copy()
-    FOMAltering = FoMStart
+    PhaseCodeBest = PhaseCodeStart.copy()
     FoMBest = FoMStart
-    IndNumber = 1
-    IterNumber = 0
+    IndNumber = 0   # fix: was 1, skipped the most effective null element on first iteration
     FoMTarget = Noise_level + 3
-    N = len(PhaseCodeBest)
+    N_elem = len(PhaseCodeBest)
 
-    while FOMAltering > FoMTarget:
+    # Guard against catastrophic main-beam collapse (inherent 1-bit array limitation).
+    # Allow at most 6 dB loss (|AF| ≥ half of initial) so null-forming never destroys the signal.
+    AF0 = np.abs(np.sum(np.exp(1j * np.deg2rad(error_calculator(D, theta, phi, PhaseCodeStart)))))
+    min_AF = AF0 / 2.0
+
+    while FoMBest > FoMTarget:
         PhaseCodeAltering = PhaseCodeBest.copy()
-        Flag, ElementIndex = find_most_effective_null_multi(D, theta, phi, thetaN, phiN, WeightsN, PhaseCodeAltering, IndNumber)
+        _, ElementIndex = find_most_effective_null_multi(
+            D, theta, phi, thetaN, phiN, WeightsN, PhaseCodeAltering, IndNumber
+        )
         PhaseCodeAltering[ElementIndex] += 180
-        FOMAltering, _ = fom_calc_null_multi_internal(D, PhaseCodeAltering, theta, phi, thetaN, phiN, RN, Noise_level)
+
+        # Beam-loss guard: skip flips that collapse the main beam beyond 6 dB.
+        AF = np.abs(np.sum(np.exp(1j * np.deg2rad(error_calculator(D, theta, phi, PhaseCodeAltering)))))
+        if AF < min_AF:
+            IndNumber += 1
+            if IndNumber >= N_elem:
+                break
+            continue
+
+        FOMAltering, _ = fom_calc_null_multi_internal(
+            D, PhaseCodeAltering, theta, phi, thetaN, phiN, RN, Noise_level
+        )
 
         if FOMAltering < FoMBest:
             PhaseCodeBest = PhaseCodeAltering.copy()
             FoMBest = FOMAltering
-            IndNumber = 1
+            IndNumber = 0   # reset to best element after each successful flip
         else:
             IndNumber += 1
-            if IndNumber >= N:
+            if IndNumber >= N_elem:
                 break
-        IterNumber += 1
 
     Signal = find_gain_of_tphi(theta, phi, PhaseCodeBest, D) - total_path_loss(R)
-    # Interference calculation
-    # Original:
-    # Interference= np.zeros_like(InterferenceStartdB)
-    # for i in range(len(RN)):
-    #   Interference[i] = find_gain_of_tphi(thetaN[i],phiN[i], PhaseCodeBest, D)-total_path_loss(RN[i])
-
-    # Wait, total_path_loss from channel.py needs import.
-
-    Interference = np.zeros_like(InterferenceStartdB)
-    for i in range(len(RN)):
-        Interference[i] = find_gain_of_tphi(thetaN[i], phiN[i], PhaseCodeBest, D) - total_path_loss(RN[i])
+    Interference = _gain_batch(thetaN, phiN, PhaseCodeBest, D) - np.vectorize(total_path_loss)(RN)
 
     return Signal, Interference
-
-def fom_calc_null_multi_internal(D, PhaseCode, theta0, phi0, thetaN, phiN, RN, Noise_level):
-    Gain0 = find_gain_of_tphi_n(theta0, phi0, PhaseCode, D)
-    GainArr = np.zeros_like(thetaN)
-    for i in range(len(RN)):
-        GainNull = find_gain_of_tphi(thetaN[i], phiN[i], PhaseCode, D) - db(RN[i])
-        if GainNull < Noise_level:
-            GainNull = Noise_level
-        GainArr[i] = GainNull
-    FoM = Gain0 + np.max(GainArr)
-    return FoM, Gain0

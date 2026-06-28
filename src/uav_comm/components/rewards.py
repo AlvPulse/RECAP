@@ -1,87 +1,75 @@
 
 import numpy as np
 
-MIN_PROGRESS = 1e-4
 MAX_NEED = 10
+# Maximum achievable throughput per user per step (used for normalisation).
+# bandwidth=0.35 GHz, SINR≈500 linear (27 dB), dt=0.25 s  →  ~0.78 Gbits
+_MAX_THR_PER_STEP = 0.35 * np.log2(1 + 500) * 0.25
 
 
-def calculate_reward_function(throughputs_per_user, delay, progress, needs, active_users, current_time, max_episode_time):
+def calculate_reward_function(throughputs_per_user, sinr_per_user, sinr_threshold_linear,
+                               delay, progress, needs, active_users):
     """
-    Reward design rationale
-    -----------------------
-    The previous JFI-on-state reward had a credit-assignment problem: it told the agent
-    how fair the CURRENT STATE was, but not which action this step was responsible for.
-    The agent could not learn "I chose user 3 because they were falling behind."
+    Reward design — everything is normalised to [0, ~1] so components are comparable.
 
-    New design uses three components, each with a distinct role:
+    Component 1 – SINR quality  (primary: the RL's core contribution)
+        Measures how well null-forming worked for users served THIS step.
+        log2(1+SINR)/10 maps SINR=[0,500] → [0, 0.9].
+        Only computed for users that received non-zero throughput this step.
+        → Gives immediate feedback: "choosing those users led to this SINR."
+        The RL can learn: large angular separation → better nulls → higher SINR → higher reward.
 
-    1. Urgency-weighted throughput  (primary, immediate, action-correlated)
-       Weight_i = (delay_i + 1) × remaining_deficit_i, normalised to sum=1.
-       This directly rewards serving the most-neglected user THIS step.
-       A user who has waited 8 steps with 90% remaining gets 8× the reward credit
-       compared to a freshly-served user with 10% remaining.
-       → Implements an LWDF-inspired (Largest Weighted Delay First) per-step objective.
+    Component 2 – Urgency-weighted normalised throughput  (fairness-aware service)
+        Weight_i = (delay_i + 1) × remaining_need_i.
+        Users who have waited longest AND have the most left to do get the highest weight.
+        Throughput is normalised by the theoretical maximum per step.
+        → Per-step signal: "did you serve the right user this step?"
 
-    2. Min-progress ratio  (secondary, state-level max-min fairness)
-       = min(progress_i / needs_i) over active users.
-       Ranges [0, 1]. Directly measures how well the WORST-OFF user is doing.
-       Complements urgency weighting: even if urgency rewards were given, this
-       catches episodes where the agent still neglected one user.
+    Component 3 – Min-progress ratio  (max-min fairness, state-level)
+        min(progress_i / need_i) over active users.
+        Catches persistent neglect that per-step urgency weighting may miss.
 
-    3. Delay-JFI  (tertiary, state-level delay equity)
-       Kept as a softer secondary signal. Lower weight than before.
-
-    4. Progress reward  (completion incentive)
-       Increases as users finish. Ensures the agent still aims to complete the episode.
+    Component 4 – Completion progress  (episode termination incentive)
     """
     n_active = int(np.sum(active_users))
     n_half_life = int(np.sum((needs / 2) > progress))
 
-    # --- 1. Urgency-weighted throughput ---
+    # --- 1. SINR quality ---
+    served = throughputs_per_user > 0
+    served_active = served & active_users
+    if np.sum(served_active) > 0:
+        sinr_quality = float(np.mean(np.log2(1.0 + sinr_per_user[served_active]) / 10.0))
+    else:
+        sinr_quality = 0.0
+
+    # --- 2. Urgency-weighted normalised throughput ---
     remaining = np.maximum(needs - progress, 0.0)
     raw_urgency = (delay + 1.0) * remaining
     raw_urgency[~active_users] = 0.0
     urgency_sum = raw_urgency.sum()
-    if urgency_sum > 1e-6:
-        urgency = raw_urgency / urgency_sum
-    else:
-        urgency = np.zeros_like(raw_urgency)
+    urgency = raw_urgency / urgency_sum if urgency_sum > 1e-6 else np.zeros_like(raw_urgency)
+    urgency_thr = float(np.dot(throughputs_per_user, urgency))
+    norm_urgency_thr = min(urgency_thr / (_MAX_THR_PER_STEP + 1e-9), 1.0)
 
-    urgency_weighted_thr = float(np.dot(throughputs_per_user, urgency))
-    total_thr = float(np.sum(throughputs_per_user))
-
-    # --- 2. Min-progress ratio (max-min fairness) ---
+    # --- 3. Min-progress (max-min fairness) ---
     if n_active > 0:
         prog_ratios = progress[active_users] / np.maximum(needs[active_users], 1e-6)
-        min_progress_ratio = float(np.min(prog_ratios))
+        min_progress = float(np.min(prog_ratios))
     else:
-        min_progress_ratio = 1.0
+        min_progress = 1.0
 
-    # --- 3. Delay JFI (state-level equity signal, lower weight than before) ---
-    if n_active > 1:
-        d = delay[active_users]
-        jfi_delay = float((np.sum(d) ** 2) / (n_active * np.sum(d ** 2) + 1e-6))
-    else:
-        jfi_delay = 1.0
+    # --- 4. Completion ---
+    completion_reward = 1.0 / (n_active + 0.5) + 0.5 / (n_half_life + 1)
 
-    # --- 4. Progress reward ---
-    progress_reward = 1.0 / (n_active + 0.5) + 0.5 / (n_half_life + 1)
-
-    # Weights chosen so components contribute proportionately:
-    # urgency_weighted_thr ~ 0.1-0.7 Gbits → ×4 → 0.4-2.8
-    # total_thr ~ 0.3-2.0 Gbits → ×0.5 → 0.15-1.0
-    # min_progress_ratio ~ [0,1] → ×2 → 0-2
-    # jfi_delay ~ [0,1] → ×0.5 → 0-0.5
-    # progress_reward ~ 0.2-2.5 → ×0.2 → 0.04-0.5
+    # All components comparable; total raw ≈ 2–5 per step → /10 in env → VecNormalize handles rest
     raw_reward = (
-        4.0 * urgency_weighted_thr
-        + 0.5 * total_thr
-        + 2.0 * min_progress_ratio
-        + 0.5 * jfi_delay
-        + 0.2 * progress_reward
+        2.0 * sinr_quality        # null-forming quality  [0, ~1.8]
+        + 2.0 * norm_urgency_thr  # fair service          [0, 2.0]
+        + 1.0 * min_progress      # max-min fairness      [0, 1.0]
+        + 0.3 * completion_reward # episode completion    [0, ~0.35]
     )
 
-    return raw_reward, jfi_delay, urgency_weighted_thr, min_progress_ratio, total_thr
+    return raw_reward, sinr_quality, norm_urgency_thr, min_progress, completion_reward
 
 
 class RewardTracker:
