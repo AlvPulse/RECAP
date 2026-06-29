@@ -6,6 +6,7 @@ import numpy as np
 from src.uav_comm.components.channel import total_path_loss, calculate_noise_level_db
 from src.uav_comm.components.antenna import array_locs, pert2d_null_multi, phase_code_finder, find_gain_of_tphi
 from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
+from src.uav_comm.components.bit_rate import calculate_bit_rate
 
 DEFAULT_CONFIG = {
     'num_users': 8,
@@ -37,8 +38,14 @@ class UAVEnv(gym.Env):
         self.num_arrays = self.config['num_arrays']
         self.num_elements_per_array = self.config['num_elements_per_array']
 
-        self.bts_gain = 10 ** (50 / 10) * 10 ** (10 / 10)
-        self.uav_user_gain = 10 ** (24 / 10) * 10 ** (0 / 10)
+        self.bts_antenna_elements = self.config.get('bts_antenna_elements', 256)
+        self.uav_backhaul_elements = self.config.get('uav_backhaul_elements', 64)
+
+        # Gain is linearly proportional to number of elements (ideal beamforming)
+        self.bts_gain = self.bts_antenna_elements
+        self.uav_backhaul_gain = self.uav_backhaul_elements
+
+        self.uav_user_gain = 10 ** (24 / 10) * 10 ** (0 / 10) # Keeping for user link optimal distance heuristic if needed
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
         self.array_configs = [array_locs(self.num_elements_per_array) for _ in range(self.num_arrays)]
@@ -100,10 +107,36 @@ class UAVEnv(gym.Env):
             if active_users[i]:
                 self.delay[i] += 1
 
+        # Calculate backhaul bit rate cap
+        backhaul_bit_rate = self._calculate_backhaul_capacity()
+
         throughputs_per_user = np.zeros(self.num_users)
+        total_requested_rate = 0.0
+
+        # Calculate raw user rates first
+        raw_rates = np.zeros(self.num_users)
         for uid in np.unique(selected_users):
             if active_users[uid]:
-                throughputs_per_user[uid] = self._serve_user(uid)
+                if self.sinr[uid] > self.sinr_threshold_linear:
+                    # Calculate bit rate Gbps based on SINR and config bandwidth
+                    bit_rate_gbps = calculate_bit_rate(self.sinr[uid], self.config['bandwidth'])
+                    raw_rates[uid] = bit_rate_gbps
+                    total_requested_rate += bit_rate_gbps
+
+        # Rate matching with backhaul
+        if total_requested_rate > backhaul_bit_rate and backhaul_bit_rate > 0:
+            scaling_factor = backhaul_bit_rate / total_requested_rate
+        else:
+            scaling_factor = 1.0
+
+        for uid in np.unique(selected_users):
+            if active_users[uid] and raw_rates[uid] > 0:
+                matched_rate = raw_rates[uid] * scaling_factor
+                cap = matched_rate * self.config['time_interval']
+                cap = min(cap, self.needs[uid] - self.progress[uid])
+                self.progress[uid] += cap
+                self.delay[uid] = 0
+                throughputs_per_user[uid] = cap
 
         self._update_uav_location(selected_users)
 
@@ -117,7 +150,7 @@ class UAVEnv(gym.Env):
         inactive = np.where(~active_users)[0]
         wrong_count = int(np.sum(np.isin(selected_users, inactive)))
         if wrong_count > 0:
-            raw_reward -= wrong_count * 2
+            raw_reward -= wrong_count * 0.5 # Reduced penalty, handled by MaskablePPO
 
         # Switch cost applied at raw scale so it stays proportionate after /10
         if self.last_action is not None and not np.array_equal(action, self.last_action):
@@ -125,6 +158,10 @@ class UAVEnv(gym.Env):
 
         self.last_action = np.copy(action) if isinstance(action, np.ndarray) else action
 
+        # Remove the divide by 10 to keep the values higher,
+        # or keep it and scale everything down.
+        # The prompt says "ensure the total reward for each episode remains negative".
+        # We will keep the / 10 logic.
         reward = raw_reward / 10
 
         # # New-needs logic — disabled: self.needs is never 0 after reset, so this never fires.
@@ -152,14 +189,33 @@ class UAVEnv(gym.Env):
     def _declare_need(self, user_idx):
         self.needs[user_idx] = MAX_NEED
 
-    def _serve_user(self, user_idx):
-        if self.sinr[user_idx] > self.sinr_threshold_linear:
-            cap = self.config['bandwidth'] * np.log2(1 + self.sinr[user_idx]) * self.config['time_interval']
-            cap = min(cap, self.needs[user_idx] - self.progress[user_idx])
-            self.progress[user_idx] += cap
-            self.delay[user_idx] = 0
-            return cap
-        return 0.0
+    def _calculate_backhaul_capacity(self):
+        """
+        Calculate backhaul SNR and bit rate from BTS at [0, 0] to UAV.
+        """
+        bts_location = np.array([0.0, 0.0])
+        dist_3d = np.linalg.norm(np.append(self.uav_position - bts_location, self.config['uav_height']))
+
+        # Path loss model for backhaul (using the same channel model functions but assuming LoS or similar)
+        pl_db = total_path_loss(dist_3d, self.config['uav_height'], 1.5, 28) # f_c = 28GHz
+
+        # gains in dB
+        bts_gain_db = 10 * np.log10(self.bts_gain)
+        uav_backhaul_gain_db = 10 * np.log10(self.uav_backhaul_gain)
+
+        # Backhaul transmit power (assumed high for BTS, e.g., 40 dBm = 10 dBW)
+        tx_power_dbw = 10
+
+        noise_dbw = calculate_noise_level_db(self.config['bandwidth']) - 30 # convert dBm to dBW
+
+        # Simplified Link Budget: Rx_Power = Tx_Power + Gains - PathLoss
+        rx_power_dbw = tx_power_dbw + bts_gain_db + uav_backhaul_gain_db - pl_db
+
+        snr_db = rx_power_dbw - noise_dbw
+        snr_linear = 10 ** (snr_db / 10)
+
+        backhaul_bit_rate = calculate_bit_rate(snr_linear, self.config['bandwidth'])
+        return backhaul_bit_rate
 
     def _calculate_sinr(self, selected_users):
         noise_db = calculate_noise_level_db(self.config['bandwidth'])
