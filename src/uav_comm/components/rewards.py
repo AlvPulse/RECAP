@@ -67,29 +67,18 @@ def calculate_reward_function(throughputs_per_user, delay, progress, needs, acti
     # --- 4. Progress reward ---
     progress_reward = 1.0 / (n_active + 0.5) + 0.5 / (n_half_life + 1)
 
-    # New Reward Engineering:
-    # Heavily weight total_thr (total bit rate) to reflect Shannon capacity / creating 4 perfect channels.
-    # Deprioritize urgency and fairness to allow the agent to optimize for overall throughput.
-    # Introduce a constant step penalty to force the UAV to finish the episode quickly.
-
-    # Weights chosen:
-    # total_thr ~ typically in Gbps, e.g. 0.5 - 5.0 Gbps. Weight of 5.0 makes it primary.
-    # urgency_weighted_thr: reduced to 0.5 to keep a slight hint of fairness.
-    # min_progress_ratio: reduced to 0.5.
-    # jfi_delay: reduced to 0.1.
-    # progress_reward: 0.2.
-    # Constant step penalty: -2.0. This ensures the step reward is mostly negative unless throughput is huge,
-    # driving the agent to complete the episode (all users satisfied) as soon as possible.
-
-    step_penalty = -2.0
-
+    # Weights chosen so components contribute proportionately:
+    # urgency_weighted_thr ~ 0.1-0.7 Gbits → ×4 → 0.4-2.8
+    # total_thr ~ 0.3-2.0 Gbits → ×0.5 → 0.15-1.0
+    # min_progress_ratio ~ [0,1] → ×2 → 0-2
+    # jfi_delay ~ [0,1] → ×0.5 → 0-0.5
+    # progress_reward ~ 0.2-2.5 → ×0.2 → 0.04-0.5
     raw_reward = (
-        5.0 * total_thr
-        + 0.5 * urgency_weighted_thr
-        + 0.5 * min_progress_ratio
-        + 0.1 * jfi_delay
+        4.0 * urgency_weighted_thr
+        + 0.5 * total_thr
+        + 2.0 * min_progress_ratio
+        + 0.5 * jfi_delay
         + 0.2 * progress_reward
-        + step_penalty
     )
 
     return raw_reward, jfi_delay, urgency_weighted_thr, min_progress_ratio, total_thr

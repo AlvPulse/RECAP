@@ -129,6 +129,40 @@ class MultiUserBaselines:
         self._pf_update({best}, served_rates)
         return action
 
+    def single_lwdf(self):
+        """
+        Largest Weighted Delay First (LWDF): serve argmax W_i * r_i(t)
+        Where W_i is the delay metric (e.g., waiting time or deficit).
+        A SOTA queue management scheduler.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return _single(0, self.env.num_arrays)
+
+        inst_rate = self._channel_rate_estimate()
+        # Using a combination of delay and remaining need for the weight
+        delay_weight = self.env.delay + 1.0
+        remaining_need = np.maximum(self.env.needs - self.env.progress, 0.0)
+        lwdf_metric = delay_weight * remaining_need * inst_rate
+
+        best = active[np.argmax(lwdf_metric[active])]
+        return _single(best, self.env.num_arrays)
+
+    def single_max_min(self):
+        """
+        Max-Min Fairness: serve the user with the lowest normalized progress ratio
+        to ensure strict fairness across active users.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return _single(0, self.env.num_arrays)
+
+        prog_ratios = self.env.progress / np.maximum(self.env.needs, 1e-6)
+        # We want to pick the user with the minimum progress ratio
+        # To reuse argmax style logic, we invert it (or just use argmin)
+        best = active[np.argmin(prog_ratios[active])]
+        return _single(best, self.env.num_arrays)
+
     # ------------------------------------------------------------------
     # Multi-user baselines (mode b: each array independent)
     # ------------------------------------------------------------------
@@ -186,3 +220,31 @@ class MultiUserBaselines:
             served_rates[uid] = inst_rate[uid]
         self._pf_update(set(selected.tolist()), served_rates)
         return selected
+
+    def multi_lwdf(self):
+        """
+        Multi-array Largest Weighted Delay First (LWDF).
+        """
+        active = self._active()
+        if len(active) == 0:
+            return np.zeros(self.env.num_arrays, dtype=int)
+
+        inst_rate = self._channel_rate_estimate()
+        delay_weight = self.env.delay + 1.0
+        remaining_need = np.maximum(self.env.needs - self.env.progress, 0.0)
+        lwdf_metric = delay_weight * remaining_need * inst_rate
+
+        return _top_k(lwdf_metric, active, self.env.num_arrays)
+
+    def multi_max_min(self):
+        """
+        Multi-array Max-Min Fairness.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return np.zeros(self.env.num_arrays, dtype=int)
+
+        prog_ratios = self.env.progress / np.maximum(self.env.needs, 1e-6)
+        # Sort ascending to get the users with smallest progress first
+        neg_prog = -prog_ratios
+        return _top_k(neg_prog, active, self.env.num_arrays)

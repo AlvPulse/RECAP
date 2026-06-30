@@ -134,12 +134,16 @@ def evaluate_final():
         ("S-Greedy",   "Single", lambda: bl.single_greedy()),
         ("S-RR",       "Single", lambda: bl.single_round_robin()),
         ("S-PF",       "Single", lambda: bl.single_proportional_fair()),
+        ("S-LWDF",     "Single", lambda: bl.single_lwdf()),
+        ("S-MaxMin",   "Single", lambda: bl.single_max_min()),
         # Multi-user baselines (each array independent)
         ("M-Random",   "Multi",  lambda: bl.multi_random()),
         ("M-FCFS",     "Multi",  lambda: bl.multi_fcfs()),
         ("M-Greedy",   "Multi",  lambda: bl.multi_greedy()),
         ("M-RR",       "Multi",  lambda: bl.multi_round_robin()),
         ("M-PF",       "Multi",  lambda: bl.multi_proportional_fair()),
+        ("M-LWDF",     "Multi",  lambda: bl.multi_lwdf()),
+        ("M-MaxMin",   "Multi",  lambda: bl.multi_max_min()),
     ]
 
     results = {}
@@ -192,7 +196,7 @@ def evaluate_final():
         ('completion_time', 'Completion Time (s)', gs[1, 1]),
     ]
 
-    colors = ['#4C72B0'] * 5 + ['#DD8452'] * 5 + ['#55A868'] * 1  # single / multi / RL
+    colors = ['#4C72B0'] * 7 + ['#DD8452'] * 7 + ['#55A868'] * 1  # single / multi / RL
 
     for metric, ylabel, pos in metric_info:
         ax = fig.add_subplot(pos)
