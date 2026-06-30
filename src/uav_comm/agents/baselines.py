@@ -52,7 +52,10 @@ class MultiUserBaselines:
         bw = self.env.config['bandwidth']
         noise_db = calculate_noise_level_db(bw)
         noise_lin = 10 ** (noise_db / 10)
-        N = self.env.num_elements_per_array * self.env.num_arrays
+
+        # Heterogeneous hardware: N is the sum of all elements across all arrays
+        N = sum(len(locs[0]) for locs in self.env.array_configs)
+
         array_gain_db = 20 * np.log10(N)  # coherent combining gain
 
         rates = np.zeros(self.env.num_users)

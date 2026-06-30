@@ -66,6 +66,8 @@ def train():
             norm_reward=True,
             clip_obs=10.0,
             norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time'],
+            # Note: conflict_matrix is 0/1 boolean, typically better not to normalize it strictly,
+            # but VecNormalize will ignore it if not in norm_obs_keys in SB3, or we just leave it out.
         )
 
         print("Initialising MaskablePPO...")

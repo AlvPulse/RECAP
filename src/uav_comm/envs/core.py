@@ -10,7 +10,9 @@ from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
 DEFAULT_CONFIG = {
     'num_users': 8,
     'num_arrays': 4,
-    'num_elements_per_array': 8,
+    'num_elements_regular': 8,
+    'num_elements_irregular': 16,
+    'conflict_threshold_deg': 20,
     'bandwidth': 0.35,
     'time_interval': 0.25,
     'sinr_threshold_db': 3,
@@ -35,13 +37,18 @@ class UAVEnv(gym.Env):
 
         self.num_users = self.config['num_users']
         self.num_arrays = self.config['num_arrays']
-        self.num_elements_per_array = self.config['num_elements_per_array']
+        self.num_elements_regular = self.config.get('num_elements_regular', 8)
+        self.num_elements_irregular = self.config.get('num_elements_irregular', 16)
 
         self.bts_gain = 10 ** (50 / 10) * 10 ** (10 / 10)
         self.uav_user_gain = 10 ** (24 / 10) * 10 ** (0 / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
-        self.array_configs = [array_locs(self.num_elements_per_array) for _ in range(self.num_arrays)]
+        # Heterogeneous Hardware: alternate between regular and irregular panels
+        self.array_configs = []
+        for i in range(self.num_arrays):
+            num_el = self.num_elements_regular if i % 2 == 0 else self.num_elements_irregular
+            self.array_configs.append(array_locs(num_el))
 
         if self.config['operation_mode'] == 'single':
             # Mode a: one discrete user choice, all arrays point there
@@ -51,11 +58,12 @@ class UAVEnv(gym.Env):
             self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
 
         self.observation_space = spaces.Dict({
-            'needs':          spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
-            'directions':     spaces.Box(low=-0.5, high=0.5, shape=(self.num_users,), dtype=np.float64),
-            'distance':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
-            'user_satisfied': spaces.MultiBinary(self.num_users),
-            'remaining_time': spaces.Box(low=0, high=1, shape=(1,), dtype=np.float64),
+            'needs':           spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            'directions':      spaces.Box(low=-0.5, high=0.5, shape=(self.num_users,), dtype=np.float64),
+            'distance':        spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            'user_satisfied':  spaces.MultiBinary(self.num_users),
+            'remaining_time':  spaces.Box(low=0, high=1, shape=(1,), dtype=np.float64),
+            'conflict_matrix': spaces.Box(low=0, high=1, shape=(self.num_users * self.num_users,), dtype=np.int8), # Flattened N x N
         })
 
         self.reset()
@@ -245,15 +253,31 @@ class UAVEnv(gym.Env):
             directions[i] = phi
         directions[user_satisfied] = 0.0
 
+        # Interference-Graph Spatial Conflict Matrix
+        # Flags spatial overlap where users are within `conflict_threshold_deg` of each other
+        conflict_matrix = np.zeros((self.num_users, self.num_users), dtype=np.int8)
+        threshold = self.config.get('conflict_threshold_deg', 20.0)
+
+        for i in range(self.num_users):
+            if user_satisfied[i]:
+                continue
+            for j in range(self.num_users):
+                if i != j and not user_satisfied[j]:
+                    # Shortest angular distance between -180 and 180
+                    diff = (directions[i] - directions[j] + 180) % 360 - 180
+                    if abs(diff) <= threshold:
+                        conflict_matrix[i, j] = 1
+
         remaining_time = np.clip(
             [(self.config['max_episode_time'] - self.current_time) / self.config['max_episode_time']],
             0.0, 1.0
         ).astype(np.float64)
 
         return {
-            'needs':          (needs_remaining / MAX_NEED).astype(np.float64),
-            'directions':     (directions / 360.0).astype(np.float64),
-            'distance':       (distance / (self.config['max_range'] * 2)).astype(np.float64),
-            'user_satisfied': user_satisfied.astype(np.int8),
-            'remaining_time': remaining_time,
+            'needs':           (needs_remaining / MAX_NEED).astype(np.float64),
+            'directions':      (directions / 360.0).astype(np.float64),
+            'distance':        (distance / (self.config['max_range'] * 2)).astype(np.float64),
+            'user_satisfied':  user_satisfied.astype(np.int8),
+            'remaining_time':  remaining_time,
+            'conflict_matrix': conflict_matrix.flatten(),
         }
