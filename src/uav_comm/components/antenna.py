@@ -46,12 +46,30 @@ def find_gain_of_tphi(theta, phi, PhaseCode, D):
     Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))
     return Gain
 
-def phase_code_finder(D, PhaseTable, theta, phi):
+def phase_code_finder(D, PhaseTable, theta, phi, quantization_bits=None):
+    """
+    Finds the ideal phase code for beam steering.
+    Includes an optional 'quantization_bits' argument to simulate
+    1-bit (180 deg) or 2-bit (90 deg) phase shifter errors, causing
+    unpredictable sidelobes.
+    """
     PhaseCode1 = PhaseTable[:, 0]
     ErrorArray = error_calculator(D, theta, phi, PhaseCode1)
     PhaseCode = PhaseCode1.copy()
-    mask = (ErrorArray > 90) & (ErrorArray < 270)
-    PhaseCode[mask] += 180
+
+    if quantization_bits == 1:
+        # Strict 1-bit quantization (0 or 180 degrees)
+        mask = (ErrorArray > 90) & (ErrorArray < 270)
+        PhaseCode[mask] += 180
+    elif quantization_bits == 2:
+        # 2-bit quantization (0, 90, 180, 270 degrees)
+        step = 90
+        PhaseCode = np.round(ErrorArray / step) * step
+    else:
+        # Original logic (assumed 1-bit default previously but now we make it explicit)
+        mask = (ErrorArray > 90) & (ErrorArray < 270)
+        PhaseCode[mask] += 180
+
     return PhaseCode
 
 def find_gain_of_tphi_i(thetaN, phiN, RN, PhaseCode, D):
@@ -111,8 +129,9 @@ def find_gain_of_tphi_n(theta, phi, PhaseCode, D):
     Gain = db(np.abs(np.sum(np.exp(1j * np.deg2rad(ErrorArray)))))/2
     return Gain - db(N)/2
 
-def pert2d_null_multi(D, PhaseTable, theta, phi, R, thetaN, phiN, RN, Noise_level):
-    PhaseCodeStart = phase_code_finder(D, PhaseTable, theta, phi)
+def pert2d_null_multi(D, PhaseTable, theta, phi, R, thetaN, phiN, RN, Noise_level, quantization_bits=1):
+    # Pass quantization bits to generate imperfect starting beams
+    PhaseCodeStart = phase_code_finder(D, PhaseTable, theta, phi, quantization_bits=quantization_bits)
 
     # We need to redefine fom_calc to use find_gain_of_tphi_n as per original code
     # Redefining fom_calc logic inline or updating fom_calc above

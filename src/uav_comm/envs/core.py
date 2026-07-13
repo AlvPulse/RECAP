@@ -82,6 +82,9 @@ class UAVEnv(gym.Env):
         self.current_time = 0.0
         self.last_action = None
 
+        # Reset the violation-driven mask for the new spatial layout
+        self.learned_mask = np.zeros((self.num_users, self.num_users), dtype=bool)
+
         for i in range(self.num_users):
             self._declare_need(i)
 
@@ -89,6 +92,7 @@ class UAVEnv(gym.Env):
 
     def step(self, action):
         self.current_time += self.config['time_interval']
+        conflict_repaired = False
 
         # Resolve per-array user assignments from action
         if self.config['operation_mode'] == 'single':
@@ -100,6 +104,52 @@ class UAVEnv(gym.Env):
             selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
         else:
             selected_users = action.astype(int)
+
+        # ---------------------------------------------------------------------
+        # Deterministic Repair Step (E-C Executor safety net)
+        # ---------------------------------------------------------------------
+        # The joint action might still contain physical conflicts due to the 1D
+        # expressiveness gap of standard SB3 action masks.
+        if self.config['operation_mode'] == 'multi':
+            obs = self._get_observation()
+            conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
+            valid_mask = self.get_action_mask()
+            # If multi-discrete, get_action_mask returns a tiled flat array, un-tile it to get user mask
+            user_mask = valid_mask[:self.num_users]
+
+            # Check for pairwise collisions in the sampled joint action
+            # Prioritize repairing lower-index arrays first (fixed priority)
+            for i in range(len(selected_users)):
+                for j in range(i + 1, len(selected_users)):
+                    uid_i = selected_users[i]
+                    uid_j = selected_users[j]
+
+                    if uid_i != uid_j and conflict_matrix[uid_i, uid_j] == 1:
+                        conflict_repaired = True
+                        # Collision detected! Repair the lower priority panel (j)
+                        # Find the best unmasked, non-conflicting user for panel j
+                        available_users = np.where(user_mask)[0]
+
+                        # Filter out users that conflict with already committed higher-priority panels
+                        safe_users = []
+                        for candidate in available_users:
+                            is_safe = True
+                            for k in range(i + 1): # Check against all locked higher priority panels
+                                if conflict_matrix[candidate, selected_users[k]] == 1:
+                                    is_safe = False
+                                    break
+                            if is_safe:
+                                safe_users.append(candidate)
+
+                        if len(safe_users) > 0:
+                            # Heuristic: pick the one with highest need
+                            remaining_needs = self.needs[safe_users] - self.progress[safe_users]
+                            best_candidate = safe_users[np.argmax(remaining_needs)]
+                            selected_users[j] = best_candidate
+                        else:
+                            # Deadlock: No safe users left. Force to target the same user as panel i (CoMP mode)
+                            # which guarantees 0 angular separation and 0 collision.
+                            selected_users[j] = selected_users[i]
 
         self._calculate_sinr(selected_users)
 
@@ -153,6 +203,7 @@ class UAVEnv(gym.Env):
             "urgency_thr": float(urgency_thr),
             "min_progress": float(min_progress),
             "total_thr": float(total_thr),
+            "conflict_repaired": int(conflict_repaired),
         }
 
         return self._get_observation(), reward, done, truncated, info
@@ -184,9 +235,12 @@ class UAVEnv(gym.Env):
 
             if others:
                 int_dirs, int_dists = self._calculate_interference_directions(others)
+                # Introduce phase quantization errors (1-bit for small panels, 2-bit for large)
+                q_bits = 1 if len(D) <= 8 else 2
                 sig_db, int_db = pert2d_null_multi(
                     D, PhaseTable, theta, phi, R,
-                    int_dirs[:, 0], int_dirs[:, 1], int_dists, noise_db
+                    int_dirs[:, 0], int_dirs[:, 1], int_dists, noise_db,
+                    quantization_bits=q_bits
                 )
                 signals[uid] += 10 ** (sig_db / 10)
                 for k, int_uid in enumerate(others):
@@ -198,6 +252,18 @@ class UAVEnv(gym.Env):
 
         noise_lin = 10 ** (noise_db / 10)
         self.sinr = signals / (interferences + noise_lin)
+
+        # M-B Violation-driven Mask Growth
+        # If interference between two targeted users causes SINR to drop below threshold, mask them.
+        sinr_db_vals = 10 * np.log10(self.sinr + 1e-9)
+        violation_threshold = self.config['sinr_threshold_db']
+
+        for i, uid_i in enumerate(selected_users):
+            for j, uid_j in enumerate(selected_users):
+                if i != j and uid_i != uid_j:
+                    if sinr_db_vals[uid_i] < violation_threshold or sinr_db_vals[uid_j] < violation_threshold:
+                        self.learned_mask[uid_i, uid_j] = True
+                        self.learned_mask[uid_j, uid_i] = True
 
     def _calculate_direction(self, user_location):
         dx, dy = user_location - self.uav_position
@@ -233,14 +299,37 @@ class UAVEnv(gym.Env):
         return loc - (d / norm) * optimal_dist
 
     def get_action_mask(self):
+        # 1. Base Mask: Are users satisfied?
         user_mask = (self.needs > self.progress).astype(bool)
+
+        # 2. Physics-Informed Saftey Mask (E-C: One-Shot Conservative Masking)
+        # If any active user has a spatial conflict with another active user,
+        # we strictly mask them out of the current step to prevent interference.
+        obs = self._get_observation()
+        conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
+
+        # Determine users that are in active conflict
+        # Only consider conflicts between users that actually need data
+        active_conflicts = (conflict_matrix > 0) & np.outer(user_mask, user_mask)
+
+        # Any user involved in a conflict is marked as unsafe
+        unsafe_users = np.any(active_conflicts, axis=1)
+
+        # The final mask: User must need data AND must be safe from conflicts
+        final_mask = user_mask & (~unsafe_users)
+
+        # Fallback: if the mask is too strict and blocks everyone who needs data,
+        # fall back to the base user_mask to prevent a deadlock.
+        if not np.any(final_mask) and np.any(user_mask):
+            final_mask = user_mask
+
         if self.config.get('operation_mode', 'multi') == 'single':
             # Discrete action space: mask shape = (num_users,)
-            return user_mask
+            return final_mask
         else:
             # MultiDiscrete action space: flat mask shape = (num_users * num_arrays,)
             # sb3_contrib expects masks for all dimensions concatenated into one 1-D array.
-            return np.tile(user_mask, self.num_arrays)
+            return np.tile(final_mask, self.num_arrays)
 
     def _get_observation(self):
         needs_remaining = np.maximum(self.needs - self.progress, 0.0)
@@ -253,9 +342,22 @@ class UAVEnv(gym.Env):
             directions[i] = phi
         directions[user_satisfied] = 0.0
 
+        # Epsilon-Probing (Anti-Ratchet Mechanism)
+        # Asymmetric Probing: Randomly decay ONE element of the learned mask
+        epsilon_probe = 0.10
+        if np.random.rand() < epsilon_probe:
+            mask_indices = np.argwhere(self.learned_mask)
+            if len(mask_indices) > 0:
+                # Select a random True index and set it to False
+                choice_idx = np.random.choice(len(mask_indices))
+                idx = mask_indices[choice_idx]
+                self.learned_mask[idx[0], idx[1]] = False
+                self.learned_mask[idx[1], idx[0]] = False
+
         # Interference-Graph Spatial Conflict Matrix
+        # M-A Deterministic Base Mask (Geometric Array Factor Proxy)
         # Flags spatial overlap where users are within `conflict_threshold_deg` of each other
-        conflict_matrix = np.zeros((self.num_users, self.num_users), dtype=np.int8)
+        base_mask = np.zeros((self.num_users, self.num_users), dtype=np.int8)
         threshold = self.config.get('conflict_threshold_deg', 20.0)
 
         for i in range(self.num_users):
@@ -266,7 +368,10 @@ class UAVEnv(gym.Env):
                     # Shortest angular distance between -180 and 180
                     diff = (directions[i] - directions[j] + 180) % 360 - 180
                     if abs(diff) <= threshold:
-                        conflict_matrix[i, j] = 1
+                        base_mask[i, j] = 1
+
+        # M-D Hybrid Mask = Deterministic Core (M-A) UNION Learned Violations (M-B)
+        conflict_matrix = np.logical_or(base_mask, self.learned_mask).astype(np.int8)
 
         remaining_time = np.clip(
             [(self.config['max_episode_time'] - self.current_time) / self.config['max_episode_time']],
