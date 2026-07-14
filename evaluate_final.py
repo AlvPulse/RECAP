@@ -204,9 +204,9 @@ def evaluate_final():
             print(f"Total Steps Evaluated: {total_actions}")
             print(f"Total Actions Requiring Repair: {total_repairs}")
             print(f"Empirical Conflict Repair Rate: {repair_rate:.2f}%")
-            print("\nNote: A low conflict repair rate confirms the Decoupling Lemma,")
-            print("proving the 1D conservative mask successfully avoids exponential")
-            print("joint-action collisions in the 5G NR continuous action space.")
+            print("\nNote: A low conflict repair rate under a trained policy confirms")
+            print("the Decoupling Lemma, proving the 1D conservative mask successfully")
+            print("avoids exponential joint-action collisions.")
         print("=" * 60)
 
     # ── Plot ─────────────────────────────────────────────────────────────────

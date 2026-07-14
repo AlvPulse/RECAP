@@ -13,18 +13,21 @@ For null constraints stacked in matrix $V$, the achievable gain toward $u$ is th
 
 **The Lemma:** *If the pairwise mask enforces angular separation beyond the Half-Power Beamwidth (HPBW) between every serve direction and every null direction, the steering-vector Gram matrix is diagonally dominant. Joint feasibility deviates from the product of pairwise feasibilities by a bounded $\epsilon$ (a Gershgorin-type bound).*
 
-**Conclusion:** The mask creates the very conditions under which a simple pairwise approximation is valid. We do not suffer the curse of dimensionality *because* we mask.
+## 3. The DoF-Budget (Rank) Constraint
+While the Decoupling Lemma handles angular proximity, small arrays (e.g., 8-element) suffer from **Degrees of Freedom (DoF) Exhaustion**. An $N$-element array has $N-1$ degrees of freedom. Forcing it to null multiple users under coarse (1-bit or 2-bit) phase quantization rapidly exhausts this budget, collapsing the mainlobe regardless of angular separation.
 
-## 3. The Architecture: M-D Generator & E-C Executor
+This is a **deterministic, non-combinatorial limit**. We augment the pairwise mask with a **DoF-Budget Constraint**: the spatial rank of the simultaneous null constraints must not exceed the effective quantized rank limit of the panel.
+
+## 4. The Architecture: M-D Generator & E-C Executor
 
 ### The Mask Generator (M-D: Structured Hybrid)
-The mask is a union of a deterministic core and learned residual regions:
-1. **M-A (Deterministic Core):** A pairwise feasibility table based on the geometric array factor (HPBW + first-null width).
-2. **M-B (Violation-Driven Growth):** The mask grows to absorb residual second-order joint effects that the pairwise table misses (e.g., quantization-lobe interactions due to 1-bit or 2-bit phase shifters).
-3. **Anti-Ratchet ($\epsilon$-Probing):** To prevent "Capacity Collapse" (where the mask ratchets outward indefinitely and permanently shrinks the feasible space), we use asymmetric $\epsilon$-probing. We explicitly relax one mask cell at a time in low-stakes slots to test if the boundary can be shrunk safely.
+The mask is a union of three layers:
+1. **M-A (Deterministic Pairwise Core):** A feasibility table based on angular separation (HPBW + first-null width).
+2. **M-DoF (Cardinality Limit):** A strict block on joint actions that exceed the effective rank capability of the hardware.
+3. **M-B (Violation-Driven Growth):** Absorbs residual unmodeled effects (e.g., unpredictable quantization lobes). Includes **Asymmetric $\epsilon$-Probing** to explicitly test boundaries and prevent "Capacity Collapse."
 
 ### The Executor (E-C: One-Shot Conservative Masking with Repair)
-Standard PPO per-head masks cannot express joint conditional constraints (e.g., "User $u$ is forbidden for Panel $i$ *only if* Panel $j$ picks User $v$").
-1. **One-Shot Masking:** We mask the *union* of regions that any head could trigger.
-2. **Deterministic Repair:** Because sampled joint actions can still occasionally collide due to expressiveness gaps, we implement a deterministic repair step. If a joint action contains a conflict, a fixed-priority order reassigns the lower-priority panel to its best unmasked alternative.
-3. **Validation:** If the Decoupling Lemma holds, the repair is almost never invoked. We log the empirical **conflict rate** as direct proof of the lemma.
+Because standard PPO per-head masks cannot express joint conditional constraints natively:
+1. **One-Shot Masking:** We mask the *union* of pairwise forbidden regions.
+2. **Deterministic Repair:** We implement a deterministic repair step in the environment. If a sampled joint action violates the pairwise or DoF constraints, a fixed-priority order reassigns the lower-priority panel.
+3. **Validation:** By tracking the **empirical conflict repair rate** under a trained policy, we directly prove that the Decoupling Lemma holds (repairs approach zero as the policy respects the 1D conservative mask boundaries).
