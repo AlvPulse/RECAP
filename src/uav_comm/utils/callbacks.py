@@ -1,7 +1,35 @@
 
+import os
 import mlflow
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+
+
+class VecNormalizeCheckpointCallback(BaseCallback):
+    """Save VecNormalize statistics alongside each model checkpoint.
+
+    The standard CheckpointCallback saves only model weights (.zip).
+    This callback saves the VecNormalize pkl at the same cadence so that
+    checkpoints can be evaluated with proper observation normalisation.
+    """
+
+    def __init__(self, save_freq, save_path, name_prefix="ppo_uav", verbose=0):
+        super().__init__(verbose)
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.save_freq == 0:
+            vec_env = self.model.get_vec_normalize_env()
+            if vec_env is not None:
+                path = os.path.join(
+                    self.save_path,
+                    f"{self.name_prefix}_{self.num_timesteps}_steps_vecnorm.pkl"
+                )
+                vec_env.save(path)
+        return True
+
 
 class MLflowCallback(BaseCallback):
     def __init__(self, verbose=0):
