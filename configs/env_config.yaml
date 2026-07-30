@@ -1,7 +1,10 @@
 
 num_users: 8
 num_arrays: 4
-num_elements_per_array: 8
+# Heterogeneous Panels Configuration
+num_elements_regular: 8      # Broader beam, lower gain (Group A)
+num_elements_irregular: 16   # Pencil beam, higher gain (Group B)
+conflict_threshold_deg: 20   # Spatial conflict matrix threshold
 max_episode_time: 30
 uav_speed: 30
 uav_height: 50

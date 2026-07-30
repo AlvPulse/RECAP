@@ -68,7 +68,8 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
     inner = vec_env.envs[0].env   # ActionMasker → UAVEnv
     inner.reset(seed=seed)
     obs = vec_env.reset()
-
+    total_actions = 0
+    conflict_repairs = 0
     total_reward = 0.0
     last_progress = np.zeros(inner.num_users)
     last_needs = np.ones(inner.num_users) * 10.0
@@ -81,11 +82,19 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
         last_time = getattr(inner, 'current_time', 0)
         action_masks = np.array([e.env.get_action_mask() for e in vec_env.envs])
         action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
-        obs, reward, done_arr, _ = vec_env.step(action)
+        obs, reward, done_arr, info = vec_env.step(action)
+        total_actions += 1
+
+        # Track the repair trigger rate for the Decoupling Lemma proof
+        if info and len(info) > 0 and "conflict_repaired" in info[0]:
+            conflict_repairs += info[0]["conflict_repaired"]
+        
         total_reward += float(reward[0])
         if done_arr[0]:
             all_done = True
             break
+    
+        
 
     n_users = inner.num_users
     served = np.sum(last_progress >= last_needs)
@@ -99,6 +108,8 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
         'completion_rate': completion_rate,
         'fairness_jfi': fairness,
         'completion_time': completion_time,
+        'conflict_repairs': conflict_repairs,
+        'total_actions': total_actions
     }
 
 
@@ -196,17 +207,21 @@ def evaluate_final():
     # Each entry: (label, category, action_fn)
     algorithms = [
         # Single-user baselines (all arrays → one user)
-        ("S-Random",   "Single",  lambda: bl.single_random()),
-        ("S-FCFS",     "Single",  lambda: bl.single_fcfs()),
-        ("S-Greedy",   "Single",  lambda: bl.single_greedy()),
-        ("S-RR",       "Single",  lambda: bl.single_round_robin()),
-        ("S-PF",       "Single",  lambda: bl.single_proportional_fair()),
+        ("S-Random",   "Single", lambda: bl.single_random()),
+        ("S-FCFS",     "Single", lambda: bl.single_fcfs()),
+        ("S-Greedy",   "Single", lambda: bl.single_greedy()),
+        ("S-RR",       "Single", lambda: bl.single_round_robin()),
+        ("S-PF",       "Single", lambda: bl.single_proportional_fair()),
+        ("S-LWDF",     "Single", lambda: bl.single_lwdf()),
+        ("S-MaxMin",   "Single", lambda: bl.single_max_min()),
         # Multi-user baselines (each array independent)
-        ("M-Random",   "Multi",   lambda: bl.multi_random()),
-        ("M-FCFS",     "Multi",   lambda: bl.multi_fcfs()),
-        ("M-Greedy",   "Multi",   lambda: bl.multi_greedy()),
-        ("M-RR",       "Multi",   lambda: bl.multi_round_robin()),
-        ("M-PF",       "Multi",   lambda: bl.multi_proportional_fair()),
+        ("M-Random",   "Multi",  lambda: bl.multi_random()),
+        ("M-FCFS",     "Multi",  lambda: bl.multi_fcfs()),
+        ("M-Greedy",   "Multi",  lambda: bl.multi_greedy()),
+        ("M-RR",       "Multi",  lambda: bl.multi_round_robin()),
+        ("M-PF",       "Multi",  lambda: bl.multi_proportional_fair()),
+        ("M-LWDF",     "Multi",  lambda: bl.multi_lwdf()),
+        ("M-MaxMin",   "Multi",  lambda: bl.multi_max_min()),
         # Angular-separation-aware greedy (strongest non-RL multi baseline)
         ("M-Angular",  "Multi",   lambda: bl.multi_angular_greedy()),
     ]
@@ -247,6 +262,23 @@ def evaluate_final():
         print(f"{label:<14} {r:>10.2f} {c:>11.1f}% {j:>8.3f} {t:>10.2f}")
     print("=" * 70)
 
+    if rl_available:
+        print("\n" + "=" * 60)
+        print("Mask-Induced Decoupling Lemma Validation")
+        print("=" * 60)
+        total_actions = sum([e['total_actions'] for e in results["RL-PPO"]])
+        total_repairs = sum([e['conflict_repairs'] for e in results["RL-PPO"]])
+
+        if total_actions > 0:
+            repair_rate = (total_repairs / total_actions) * 100
+            print(f"Total Steps Evaluated: {total_actions}")
+            print(f"Total Actions Requiring Repair: {total_repairs}")
+            print(f"Empirical Conflict Repair Rate: {repair_rate:.2f}%")
+            print("\nNote: A low conflict repair rate under a trained policy confirms")
+            print("the Decoupling Lemma, proving the 1D conservative mask successfully")
+            print("avoids exponential joint-action collisions.")
+        print("=" * 60)
+
     # ── Plot ─────────────────────────────────────────────────────────────────
     labels = list(results.keys())
     n = len(labels)
@@ -261,7 +293,7 @@ def evaluate_final():
         ('completion_time', 'Completion Time (s)', gs[1, 1]),
     ]
 
-    colors = ['#4C72B0'] * 5 + ['#DD8452'] * 6 + ['#55A868'] * 1  # single(5) / multi(6) / RL(1)
+    colors = ['#4C72B0'] * 7 + ['#DD8452'] * 7 + ['#55A868'] * 1  # single / multi / RL
 
     for metric, ylabel, pos in metric_info:
         ax = fig.add_subplot(pos)
