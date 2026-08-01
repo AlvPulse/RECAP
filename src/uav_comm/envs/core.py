@@ -10,7 +10,9 @@ from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
 DEFAULT_CONFIG = {
     'num_users': 8,
     'num_arrays': 4,
-    'num_elements_per_array': 8,
+    'num_elements_regular': 8,
+    'num_elements_irregular': 16,
+    'conflict_threshold_deg': 20,
     'bandwidth': 0.35,
     'time_interval': 0.25,
     'sinr_threshold_db': 3,
@@ -35,7 +37,8 @@ class UAVEnv(gym.Env):
 
         self.num_users = self.config['num_users']
         self.num_arrays = self.config['num_arrays']
-        self.num_elements_per_array = self.config['num_elements_per_array']
+        self.num_elements_regular = self.config.get('num_elements_regular', 8)
+        self.num_elements_irregular = self.config.get('num_elements_irregular', 16)
 
         self.bts_gain = 10 ** (50 / 10) * 10 ** (10 / 10)
         tx_dbm  = self.config.get('tx_power_dbm', 43)   # UAV transmit power (dBm)
@@ -44,7 +47,11 @@ class UAVEnv(gym.Env):
         self.uav_user_gain = 10 ** ((tx_dbm + rx_dbi) / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
-        self.array_configs = [array_locs(self.num_elements_per_array) for _ in range(self.num_arrays)]
+        # Heterogeneous Hardware: alternate between regular and irregular panels
+        self.array_configs = []
+        for i in range(self.num_arrays):
+            num_el = self.num_elements_regular if i % 2 == 0 else self.num_elements_irregular
+            self.array_configs.append(array_locs(num_el))
 
         if self.config['operation_mode'] == 'single':
             self.action_space = spaces.Discrete(self.num_users)
@@ -78,6 +85,10 @@ class UAVEnv(gym.Env):
         self.current_time = 0.0
         self.last_action = None
 
+        # M-B Violation-Driven Growth Mask (Persists across episodes to learn spatial constraints)
+        if not hasattr(self, 'learned_mask'):
+            self.learned_mask = np.zeros((self.num_users, self.num_users), dtype=bool)
+
         for i in range(self.num_users):
             self._declare_need(i)
 
@@ -85,6 +96,7 @@ class UAVEnv(gym.Env):
 
     def step(self, action):
         self.current_time += self.config['time_interval']
+        conflict_repaired = False
 
         # Resolve per-array user assignments
         if self.config['operation_mode'] == 'single':
@@ -96,6 +108,58 @@ class UAVEnv(gym.Env):
             selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
         else:
             selected_users = action.astype(int)
+
+        # ---------------------------------------------------------------------
+        # E-C Executor: Deterministic Repair Step
+        # ---------------------------------------------------------------------
+        if self.config['operation_mode'] == 'multi':
+            # Instead of using conflict_matrix from obs which may not exist,
+            # calculate active conflicts manually here.
+            obs = self._get_observation()
+            directions = obs['directions'] * 360.0
+            valid_mask = self.get_action_mask()
+            user_mask = valid_mask[:self.num_users]
+
+            conflict_matrix = np.zeros((self.num_users, self.num_users), dtype=bool)
+            threshold = self.config.get('conflict_threshold_deg', 20.0)
+            for i in range(self.num_users):
+                if not user_mask[i]: continue
+                for j in range(i + 1, self.num_users):
+                    if not user_mask[j]: continue
+                    diff = (directions[i] - directions[j] + 180) % 360 - 180
+                    if abs(diff) <= threshold:
+                        conflict_matrix[i, j] = True
+                        conflict_matrix[j, i] = True
+
+            # Combine with learned mask if available
+            combined_conflict = np.logical_or(conflict_matrix, getattr(self, 'learned_mask', np.zeros_like(conflict_matrix)))
+            combined_conflict = combined_conflict.astype(int)
+
+            for i in range(len(selected_users)):
+                for j in range(i + 1, len(selected_users)):
+                    uid_i = selected_users[i]
+                    uid_j = selected_users[j]
+
+                    if uid_i != uid_j and combined_conflict[uid_i, uid_j] == 1:
+                        conflict_repaired = True
+                        available_users = np.where(user_mask)[0]
+
+                        safe_users = []
+                        for candidate in available_users:
+                            is_safe = True
+                            for k in range(i + 1):
+                                if combined_conflict[candidate, selected_users[k]] == 1:
+                                    is_safe = False
+                                    break
+                            if is_safe:
+                                safe_users.append(candidate)
+
+                        if len(safe_users) > 0:
+                            remaining_needs = self.needs[safe_users] - self.progress[safe_users]
+                            best_candidate = safe_users[np.argmax(remaining_needs)]
+                            selected_users[j] = best_candidate
+                        else:
+                            selected_users[j] = selected_users[i]
 
         self._calculate_sinr(selected_users)
 
@@ -111,9 +175,9 @@ class UAVEnv(gym.Env):
 
         self._update_uav_location(selected_users)
 
-        raw_reward, sinr_quality, urgency_thr, min_progress, completion_rew = calculate_reward_function(
-            throughputs_per_user, self.sinr, self.sinr_threshold_linear,
-            self.delay, self.progress, self.needs, active_users
+        raw_reward, jfi_delay, urgency_thr, min_progress, total_thr = calculate_reward_function(
+            throughputs_per_user, self.delay, self.progress, self.needs,
+            active_users.astype(bool), self.current_time, self.config['max_episode_time']
         )
 
         # Safety net: penalise targeting already-satisfied users (masking should prevent this).
@@ -144,9 +208,11 @@ class UAVEnv(gym.Env):
         truncated = self.current_time >= self.config['max_episode_time']
 
         info = {
-            "sinr_quality": float(sinr_quality),
-            "urgency_thr":  float(urgency_thr),
+            "JFI_delay": float(jfi_delay),
+            "urgency_thr": float(urgency_thr),
             "min_progress": float(min_progress),
+            "total_thr": float(total_thr),
+            "conflict_repaired": int(conflict_repaired),
         }
 
         return self._get_observation(), reward, done, truncated, info
@@ -188,9 +254,11 @@ class UAVEnv(gym.Env):
 
             if others:
                 int_dirs, int_dists = self._calculate_interference_directions(others)
+                q_bits = 1 if len(D) <= 8 else 2
                 sig_db, int_db = pert2d_null_multi(
                     D, PhaseTable, theta, phi, R,
-                    int_dirs[:, 0], int_dirs[:, 1], int_dists, noise_db
+                    int_dirs[:, 0], int_dirs[:, 1], int_dists, noise_db,
+                    quantization_bits=q_bits
                 )
                 signals[uid] += 10 ** (sig_db / 10)
                 for k, int_uid in enumerate(others):
@@ -207,6 +275,18 @@ class UAVEnv(gym.Env):
         p_tx_watts = self.uav_user_gain / 1000.0        # linear mW → W
         noise_eff  = 10 ** (noise_db / 10) / p_tx_watts # effective noise floor (dimensionless)
         self.sinr  = signals / (interferences + noise_eff)
+
+        # M-B Violation-Driven Mask Growth
+        sinr_db_vals = 10 * np.log10(self.sinr + 1e-9)
+        violation_threshold = self.config['sinr_threshold_db']
+
+        if hasattr(self, 'learned_mask'):
+            for i, uid_i in enumerate(selected_users):
+                for j, uid_j in enumerate(selected_users):
+                    if i != j and uid_i != uid_j:
+                        if sinr_db_vals[uid_i] < violation_threshold or sinr_db_vals[uid_j] < violation_threshold:
+                            self.learned_mask[uid_i, uid_j] = True
+                            self.learned_mask[uid_j, uid_i] = True
 
     def _calculate_direction(self, user_location):
         dx, dy = user_location - self.uav_position
@@ -245,6 +325,31 @@ class UAVEnv(gym.Env):
 
     def get_action_mask(self):
         user_mask = (self.needs > self.progress).astype(bool)
+
+        obs = self._get_observation()
+        if 'directions' not in obs: return user_mask
+        directions = obs['directions'] * 360.0
+        active_conflicts = np.zeros((self.num_users, self.num_users), dtype=bool)
+
+        threshold = self.config.get('conflict_threshold_deg', 20.0)
+        for i in range(self.num_users):
+            if not user_mask[i]: continue
+            for j in range(i + 1, self.num_users):
+                if not user_mask[j]: continue
+                diff = (directions[i] - directions[j] + 180) % 360 - 180
+                if abs(diff) <= threshold:
+                    active_conflicts[i, j] = True
+                    active_conflicts[j, i] = True
+
+        combined_conflict = np.logical_or(active_conflicts, getattr(self, 'learned_mask', np.zeros_like(active_conflicts)))
+        combined_active_conflicts = combined_conflict & np.outer(user_mask, user_mask)
+
+        unsafe_users = np.any(combined_active_conflicts, axis=1)
+        final_mask = user_mask & (~unsafe_users)
+
+        if not np.any(final_mask) and np.any(user_mask):
+            final_mask = user_mask
+
         if self.config.get('operation_mode', 'multi') == 'single':
             return user_mask
         else:
@@ -262,6 +367,44 @@ class UAVEnv(gym.Env):
             _, phi = self._calculate_direction(self.locations[i])
             directions[i] = phi
         directions[user_satisfied] = 0.0
+
+        # Anti-Ratchet Asymmetric Epsilon-Probing
+        epsilon_probe = 0.10
+        if hasattr(self, 'learned_mask') and np.random.rand() < epsilon_probe:
+            mask_indices = np.argwhere(self.learned_mask)
+            if len(mask_indices) > 0:
+                choice_idx = np.random.choice(len(mask_indices))
+                idx = mask_indices[choice_idx]
+                self.learned_mask[idx[0], idx[1]] = False
+
+        # M-A Deterministic Base Mask (Pairwise Angular Separation)
+        base_mask = np.zeros((self.num_users, self.num_users), dtype=np.int8)
+        threshold = self.config.get('conflict_threshold_deg', 20.0)
+
+        # Determine DoF Budget globally for the worst-case panel (8 elements -> rank ~ 7)
+        # If the number of active users clustered tightly exceeds this rank, we hard-mask the cluster
+        max_dof_budget = 7
+
+        for i in range(self.num_users):
+            if user_satisfied[i]:
+                continue
+
+            cluster_size = 0
+            for j in range(self.num_users):
+                if i != j and not user_satisfied[j]:
+                    diff = (directions[i] - directions[j] + 180) % 360 - 180
+                    if abs(diff) <= threshold:
+                        base_mask[i, j] = 1
+                        cluster_size += 1
+
+            # M-DoF Cardinality Limit
+            if cluster_size > max_dof_budget:
+                base_mask[i, :] = 1 # Completely invalidate this user to prevent DoF exhaustion
+
+        if hasattr(self, 'learned_mask'):
+            conflict_matrix = np.logical_or(base_mask, self.learned_mask).astype(np.int8)
+        else:
+            conflict_matrix = base_mask
 
         remaining_time = np.clip(
             [(self.config['max_episode_time'] - self.current_time) / self.config['max_episode_time']],

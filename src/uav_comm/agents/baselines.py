@@ -52,7 +52,10 @@ class MultiUserBaselines:
         bw = self.env.config['bandwidth']
         noise_db = calculate_noise_level_db(bw)
         noise_lin = 10 ** (noise_db / 10)
-        N = self.env.num_elements_per_array * self.env.num_arrays
+
+        # Heterogeneous hardware: N is the sum of all elements across all arrays
+        N = sum(len(locs[0]) for locs in self.env.array_configs)
+
         array_gain_db = 20 * np.log10(N)  # coherent combining gain
 
         rates = np.zeros(self.env.num_users)
@@ -129,6 +132,40 @@ class MultiUserBaselines:
         self._pf_update({best}, served_rates)
         return action
 
+    def single_lwdf(self):
+        """
+        Largest Weighted Delay First (LWDF): serve argmax W_i * r_i(t)
+        Where W_i is the delay metric (e.g., waiting time or deficit).
+        A SOTA queue management scheduler.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return _single(0, self.env.num_arrays)
+
+        inst_rate = self._channel_rate_estimate()
+        # Using a combination of delay and remaining need for the weight
+        delay_weight = self.env.delay + 1.0
+        remaining_need = np.maximum(self.env.needs - self.env.progress, 0.0)
+        lwdf_metric = delay_weight * remaining_need * inst_rate
+
+        best = active[np.argmax(lwdf_metric[active])]
+        return _single(best, self.env.num_arrays)
+
+    def single_max_min(self):
+        """
+        Max-Min Fairness: serve the user with the lowest normalized progress ratio
+        to ensure strict fairness across active users.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return _single(0, self.env.num_arrays)
+
+        prog_ratios = self.env.progress / np.maximum(self.env.needs, 1e-6)
+        # We want to pick the user with the minimum progress ratio
+        # To reuse argmax style logic, we invert it (or just use argmin)
+        best = active[np.argmin(prog_ratios[active])]
+        return _single(best, self.env.num_arrays)
+
     # ------------------------------------------------------------------
     # Multi-user baselines (mode b: each array independent)
     # ------------------------------------------------------------------
@@ -187,43 +224,30 @@ class MultiUserBaselines:
         self._pf_update(set(selected.tolist()), served_rates)
         return selected
 
-    def multi_angular_greedy(self):
+    def multi_lwdf(self):
         """
-        Angular-separation-aware greedy: selects num_arrays users maximising
-        pairwise angular separation from the UAV's perspective.
-
-        This is the strongest non-RL baseline for the null-forming system —
-        it directly addresses the same problem the RL is expected to learn.
-        RL should outperform it by also accounting for urgency and SINR history.
+        Multi-array Largest Weighted Delay First (LWDF).
         """
         active = self._active()
-        K = self.env.num_arrays
         if len(active) == 0:
-            return np.zeros(K, dtype=int)
-        if len(active) <= K:
-            return np.resize(active, K)
+            return np.zeros(self.env.num_arrays, dtype=int)
 
-        # Compute azimuth angles (phi) for each user from the UAV
-        azimuths = np.arctan2(
-            self.env.locations[active, 1] - self.env.uav_position[1],
-            self.env.locations[active, 0] - self.env.uav_position[0]
-        )
+        inst_rate = self._channel_rate_estimate()
+        delay_weight = self.env.delay + 1.0
+        remaining_need = np.maximum(self.env.needs - self.env.progress, 0.0)
+        lwdf_metric = delay_weight * remaining_need * inst_rate
 
-        # Greedy selection: first pick the highest-urgency user, then iteratively
-        # add the user whose minimum angular distance to already-selected users is maximal.
-        remaining = self.env.needs - self.env.progress
-        first = active[np.argmax(remaining[active])]
-        selected_local = [np.where(active == first)[0][0]]
+        return _top_k(lwdf_metric, active, self.env.num_arrays)
 
-        while len(selected_local) < K:
-            best_idx, best_sep = -1, -1.0
-            for i in range(len(active)):
-                if i in selected_local:
-                    continue
-                diffs = [abs(azimuths[i] - azimuths[j]) for j in selected_local]
-                min_sep = min(min(d, 2 * np.pi - d) for d in diffs)
-                if min_sep > best_sep:
-                    best_sep, best_idx = min_sep, i
-            selected_local.append(best_idx)
+    def multi_max_min(self):
+        """
+        Multi-array Max-Min Fairness.
+        """
+        active = self._active()
+        if len(active) == 0:
+            return np.zeros(self.env.num_arrays, dtype=int)
 
-        return active[np.array(selected_local, dtype=int)]
+        prog_ratios = self.env.progress / np.maximum(self.env.needs, 1e-6)
+        # Sort ascending to get the users with smallest progress first
+        neg_prog = -prog_ratios
+        return _top_k(neg_prog, active, self.env.num_arrays)
