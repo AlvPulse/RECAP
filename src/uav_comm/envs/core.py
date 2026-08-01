@@ -351,11 +351,11 @@ class UAVEnv(gym.Env):
             final_mask = user_mask
 
         if self.config.get('operation_mode', 'multi') == 'single':
-            return user_mask
+            return final_mask
         else:
             # sb3_contrib MaskablePPO with MultiDiscrete expects flat array of shape
             # (sum(nvec),) = (num_users * num_arrays,) — all dimension masks concatenated.
-            return np.tile(user_mask, self.num_arrays)
+            return np.tile(final_mask, self.num_arrays)
 
     def _get_observation(self):
         needs_remaining = np.maximum(self.needs - self.progress, 0.0)
