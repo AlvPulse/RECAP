@@ -74,7 +74,7 @@ def calculate_reward_function(throughputs_per_user, delay, progress, needs, acti
     # jfi_delay ~ [0,1] → ×0.5 → 0-0.5
     # progress_reward ~ 0.2-2.5 → ×0.2 → 0.04-0.5
     n_served_now = int(np.sum(progress >= needs))
-    completion_bonus = (n_served_now / 8.0) * 10.0
+    completion_bonus = (n_served_now / 8.0) * 100.0
 
     raw_reward = (
         1.0 * urgency_weighted_thr

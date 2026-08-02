@@ -48,6 +48,9 @@ def run_baseline_episode(env, action_fn, seed):
     prog_ratios = env.progress / np.maximum(env.needs, 1e-6)
     fairness = _jfi(prog_ratios)
 
+    # Average Throughput
+    avg_throughput = np.sum(env.progress) / max(env.current_time, 1e-6)
+
     # Time to completion (max_time if not fully served)
     time_used = env.current_time
     max_time = env.config['max_episode_time']
@@ -58,6 +61,7 @@ def run_baseline_episode(env, action_fn, seed):
         'completion_rate': completion_rate,
         'fairness_jfi': fairness,
         'completion_time': completion_time,
+        'avg_throughput': avg_throughput,
         'steps': step,
     }
 
@@ -102,12 +106,14 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
     prog_ratios = last_progress / np.maximum(last_needs, 1e-6)
     fairness = _jfi(prog_ratios)
     completion_time = last_time if all_done else inner.config['max_episode_time']
+    avg_throughput = np.sum(last_progress) / max(last_time, 1e-6)
 
     return {
         'reward': total_reward,
         'completion_rate': completion_rate,
         'fairness_jfi': fairness,
         'completion_time': completion_time,
+        'avg_throughput': avg_throughput,
         'conflict_repairs': conflict_repairs,
         'total_actions': total_actions
     }
@@ -246,19 +252,20 @@ def evaluate_final():
         results["RL-PPO"] = rl_eps
 
     # ── Print table ──────────────────────────────────────────────────────────
-    metrics = ['reward', 'completion_rate', 'fairness_jfi', 'completion_time']
-    headers = ['Algorithm', 'Reward', 'Completion%', 'JFI', 'Time(s)']
+    metrics = ['reward', 'completion_rate', 'fairness_jfi', 'completion_time', 'avg_throughput']
+    headers = ['Algorithm', 'Reward', 'Completion%', 'JFI', 'Time(s)', 'Thr(Gbps)']
 
-    print("\n" + "=" * 70)
-    print(f"{'Algorithm':<14} {'Reward':>10} {'Completion%':>12} {'JFI':>8} {'Time(s)':>10}")
-    print("-" * 70)
+    print("\n" + "=" * 80)
+    print(f"{'Algorithm':<14} {'Reward':>10} {'Completion%':>12} {'JFI':>8} {'Time(s)':>10} {'Thr(Gbps)':>12}")
+    print("-" * 80)
     for label, eps in results.items():
         r   = np.mean([e['reward'] for e in eps])
         c   = np.mean([e['completion_rate'] for e in eps]) * 100
         j   = np.mean([e['fairness_jfi'] for e in eps])
         t   = np.mean([e['completion_time'] for e in eps])
-        print(f"{label:<14} {r:>10.2f} {c:>11.1f}% {j:>8.3f} {t:>10.2f}")
-    print("=" * 70)
+        th  = np.mean([e['avg_throughput'] for e in eps])
+        print(f"{label:<14} {r:>10.2f} {c:>11.1f}% {j:>8.3f} {t:>10.2f} {th:>12.2f}")
+    print("=" * 80)
 
     if rl_available:
         print("\n" + "=" * 60)
