@@ -110,39 +110,13 @@ class UAVEnv(gym.Env):
             selected_users = action.astype(int)
 
         # ---------------------------------------------------------------------
-        # E-C Executor: Deterministic Repair Step
+        # Option A: Soft Probabilistic Masking / Gambling
         # ---------------------------------------------------------------------
-        if self.config['operation_mode'] == 'multi':
-            obs = self._get_observation()
-            conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
-            valid_mask = self.get_action_mask()
-            user_mask = valid_mask[:self.num_users]
-
-            for i in range(len(selected_users)):
-                for j in range(i + 1, len(selected_users)):
-                    uid_i = selected_users[i]
-                    uid_j = selected_users[j]
-
-                    if uid_i != uid_j and conflict_matrix[uid_i, uid_j] == 1:
-                        conflict_repaired = True
-                        available_users = np.where(user_mask)[0]
-
-                        safe_users = []
-                        for candidate in available_users:
-                            is_safe = True
-                            for k in range(i + 1):
-                                if conflict_matrix[candidate, selected_users[k]] == 1:
-                                    is_safe = False
-                                    break
-                            if is_safe:
-                                safe_users.append(candidate)
-
-                        if len(safe_users) > 0:
-                            remaining_needs = self.needs[safe_users] - self.progress[safe_users]
-                            best_candidate = safe_users[np.argmax(remaining_needs)]
-                            selected_users[j] = best_candidate
-                        else:
-                            selected_users[j] = selected_users[i]
+        # We no longer force a deterministic repair. Agents (including baselines)
+        # must gamble on their chosen assignments. If they pick conflicting users,
+        # the underlying physics engine (_calculate_sinr) will naturally yield a
+        # poor SINR, resulting in 0 throughput. This allows the RL to learn
+        # the optimal trade-off natively.
 
         self._calculate_sinr(selected_users)
 
@@ -194,7 +168,7 @@ class UAVEnv(gym.Env):
             "sinr_quality": float(sinr_quality),
             "urgency_thr":  float(urgency_thr),
             "min_progress": float(min_progress),
-            "total_thr": float(total_thr),
+            "total_thr": float(np.sum(throughputs_per_user)),
             "conflict_repaired": int(conflict_repaired),
         }
 
@@ -309,15 +283,21 @@ class UAVEnv(gym.Env):
     def get_action_mask(self):
         user_mask = (self.needs > self.progress).astype(bool)
 
-        obs = self._get_observation()
-        conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
+        if self.config.get('enable_spatial_masking', True):
+            # Call to ensure the latest mask components are updated, but we don't strictly need to do this
+            # if the mask logic doesn't depend on the side-effects of _get_observation.
+            # However, _get_observation sets _last_conflict_matrix, so we call it.
+            self._get_observation()
+            conflict_matrix = getattr(self, '_last_conflict_matrix', np.zeros(self.num_users * self.num_users)).reshape((self.num_users, self.num_users))
 
-        active_conflicts = (conflict_matrix > 0) & np.outer(user_mask, user_mask)
-        unsafe_users = np.any(active_conflicts, axis=1)
+            active_conflicts = (conflict_matrix > 0) & np.outer(user_mask, user_mask)
+            unsafe_users = np.any(active_conflicts, axis=1)
 
-        final_mask = user_mask & (~unsafe_users)
+            final_mask = user_mask & (~unsafe_users)
 
-        if not np.any(final_mask) and np.any(user_mask):
+            if not np.any(final_mask) and np.any(user_mask):
+                final_mask = user_mask
+        else:
             final_mask = user_mask
 
         if self.config.get('operation_mode', 'multi') == 'single':
@@ -385,6 +365,9 @@ class UAVEnv(gym.Env):
         # Zero for satisfied users (no longer relevant) and for unserved users (SINR≈0 by model).
         sinr_obs = np.clip(np.log2(1.0 + self.sinr) / 10.0, 0.0, 1.0).astype(np.float64)
         sinr_obs[user_satisfied] = 0.0
+
+        # Store conflict matrix internally for other methods to access without polluting the Observation Space
+        self._last_conflict_matrix = conflict_matrix.flatten()
 
         return {
             'needs':          (needs_remaining / MAX_NEED).astype(np.float64),
