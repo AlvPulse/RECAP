@@ -37,7 +37,8 @@ def run_baseline_episode(env, action_fn, seed):
     while not done and not truncated:
         action = action_fn()
         obs, reward, done, truncated, info = env.step(action)
-        total_reward += reward
+        # Use true_reward for evaluation to ignore behavioral shapings
+        total_reward += info.get('true_reward', reward)
         step += 1
 
     n_users = env.num_users
@@ -89,7 +90,11 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
         if info and len(info) > 0 and "conflict_repaired" in info[0]:
             conflict_repairs += info[0]["conflict_repaired"]
         
-        total_reward += float(reward[0])
+        if info and len(info) > 0 and "true_reward" in info[0]:
+            total_reward += float(info[0]["true_reward"])
+        else:
+            total_reward += float(reward[0])
+
         if done_arr[0]:
             all_done = True
             break

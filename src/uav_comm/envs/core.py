@@ -137,30 +137,45 @@ class UAVEnv(gym.Env):
             self.delay, self.progress, self.needs, active_users
         )
 
-        # Safety net: penalise targeting already-satisfied users (masking should prevent this).
+        # ---------------------------------------------------------------------
+        # Reward Engineering: True Reward vs. Behavioral Shaping (Train Reward)
+        # ---------------------------------------------------------------------
+        # True Reward: Strictly based on system performance (throughput, fairness, completion)
+        true_reward = raw_reward / 10.0
+
+        # Behavioral Shaping (Train Reward): Add penalties for gambling failures
+        train_reward = true_reward
+
+        # 1. Safety net: penalise targeting already-satisfied users
         inactive = np.where(~active_users)[0]
         wrong_count = int(np.sum(np.isin(selected_users, inactive)))
         if wrong_count > 0:
-            raw_reward -= wrong_count * 2
+            train_reward -= (wrong_count * 2) / 10.0
 
-        # Switch cost applied at raw scale (consistent with /10 below)
+        # 2. Switch cost
         if self.last_action is not None and not np.array_equal(action, self.last_action):
-            raw_reward -= self.config['switch_cost']
+            train_reward -= self.config['switch_cost'] / 10.0
+
+        # 3. Gambling/Interference Penalty:
+        # If an agent tried to serve a user but failed (0 throughput) due to interference
+        # (SINR < threshold), apply a sharp penalty to teach them to avoid overlapping beams.
+        failed_gambles = 0
+        for uid in np.unique(selected_users):
+            if active_users[uid] and throughputs_per_user[uid] == 0:
+                failed_gambles += 1
+
+        if failed_gambles > 0:
+            train_reward -= (failed_gambles * 1.5) / 10.0
 
         self.last_action = np.copy(action) if isinstance(action, np.ndarray) else action
 
-        reward = raw_reward / 10
-
-        # # New-needs logic — disabled: self.needs is never 0 after reset, so this never fires.
-        # if np.random.rand() < 0.2:
-        #     if len(inactive) > 0:
-        #         idx = np.random.choice(inactive)
-        #         if self.needs[idx] == 0:
-        #             self._declare_need(idx)
-
         done = bool(np.all(self.progress >= self.needs))
+
+        # Completion Bonus (Applied to both)
         if done:
-            reward += 0.0002 * (self.config['max_episode_time'] - self.current_time) ** 2
+            completion_bonus = 0.0002 * (self.config['max_episode_time'] - self.current_time) ** 2
+            true_reward += completion_bonus
+            train_reward += completion_bonus
 
         truncated = self.current_time >= self.config['max_episode_time']
 
@@ -170,9 +185,11 @@ class UAVEnv(gym.Env):
             "min_progress": float(min_progress),
             "total_thr": float(np.sum(throughputs_per_user)),
             "conflict_repaired": int(conflict_repaired),
+            "true_reward": float(true_reward), # Pure telecom evaluation metric
         }
 
-        return self._get_observation(), reward, done, truncated, info
+        # Return the shaped train_reward to the RL agent
+        return self._get_observation(), train_reward, done, truncated, info
 
     def _declare_need(self, user_idx):
         self.needs[user_idx] = MAX_NEED
