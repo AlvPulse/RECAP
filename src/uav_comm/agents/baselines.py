@@ -167,6 +167,38 @@ class MultiUserBaselines:
         return _single(best, self.env.num_arrays)
 
     # ------------------------------------------------------------------
+    # H-MARL baselines (Strategist outputs sectors)
+    # ------------------------------------------------------------------
+
+    def hmarl_static(self):
+        """Assigns each array to a fixed sector (e.g., Array 0 -> Sector 0)"""
+        num_sectors = self.env.config.get('num_sectors', 4)
+        return np.array([i % num_sectors for i in range(self.env.num_arrays)], dtype=int)
+
+    def hmarl_random(self):
+        """Randomly assigns arrays to any valid sector that contains users."""
+        num_sectors = self.env.config.get('num_sectors', 4)
+        # Replicate logic from env.get_action_mask() for H-MARL
+        sector_mask = np.zeros(num_sectors, dtype=bool)
+        sector_width = 360.0 / num_sectors
+        active = self._active()
+
+        for u in active:
+            loc = self.env.locations[u]
+            # Use environment's internal trigonometry parser to avoid unpacking errors from 3D to 2D
+            _, phi = self.env._calculate_direction(loc)
+            phi_mapped = (phi + 180.0) % 360.0
+            s_idx = int(phi_mapped // sector_width)
+            s_idx = min(s_idx, num_sectors - 1)
+            sector_mask[s_idx] = True
+
+        valid_sectors = np.where(sector_mask)[0]
+        if len(valid_sectors) == 0:
+            return np.zeros(self.env.num_arrays, dtype=int)
+
+        return np.random.choice(valid_sectors, size=self.env.num_arrays, replace=True)
+
+    # ------------------------------------------------------------------
     # Multi-user baselines (mode b: each array independent)
     # ------------------------------------------------------------------
 

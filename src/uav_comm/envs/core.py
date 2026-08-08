@@ -53,10 +53,15 @@ class UAVEnv(gym.Env):
             num_el = self.num_elements_regular if i % 2 == 0 else self.num_elements_irregular
             self.array_configs.append(array_locs(num_el))
 
-        if self.config['operation_mode'] == 'single':
-            self.action_space = spaces.Discrete(self.num_users)
+        if self.config.get('h_marl_mode', False):
+            # Strategist assigns one of num_sectors to each array
+            self.num_sectors = self.config.get('num_sectors', 4)
+            self.action_space = spaces.MultiDiscrete([self.num_sectors] * self.num_arrays)
         else:
-            self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
+            if self.config['operation_mode'] == 'single':
+                self.action_space = spaces.Discrete(self.num_users)
+            else:
+                self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
 
         self.observation_space = spaces.Dict({
             'needs':          spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
@@ -99,15 +104,53 @@ class UAVEnv(gym.Env):
         conflict_repaired = False
 
         # Resolve per-array user assignments
-        if self.config['operation_mode'] == 'single':
-            uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
-            selected_users = np.full(self.num_arrays, uid, dtype=int)
-        elif isinstance(action, (int, np.integer)):
-            selected_users = np.full(self.num_arrays, int(action), dtype=int)
-        elif isinstance(action, np.ndarray) and action.ndim == 0:
-            selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
+        if self.config.get('h_marl_mode', False):
+            # action is an array of sector indices for each antenna array
+            sectors = action.astype(int)
+            selected_users = np.zeros(self.num_arrays, dtype=int)
+
+            # Fast-timescale distributed Actor logic: pick highest urgency user in assigned sector
+            sector_width = 360.0 / self.num_sectors
+
+            for i in range(self.num_arrays):
+                target_sector = sectors[i]
+                start_angle = target_sector * sector_width - 180.0
+                end_angle = (target_sector + 1) * sector_width - 180.0
+
+                # Directions observation is normalized from actual phi [-180, 180]
+                # Let's map it back to physical phi bounds for sector assignment.
+                phis = np.zeros(self.num_users)
+                for u in range(self.num_users):
+                    _, phis[u] = self._calculate_direction(self.locations[u])
+
+                valid_users = []
+                for u in range(self.num_users):
+                    if self.needs[u] > self.progress[u] and start_angle <= phis[u] < end_angle:
+                        valid_users.append(u)
+
+                if valid_users:
+                    # Actor heuristically picks the user with the most remaining need in its sector
+                    remaining_needs = self.needs[valid_users] - self.progress[valid_users]
+                    selected_users[i] = valid_users[np.argmax(remaining_needs)]
+                else:
+                    # If sector is empty, fallback to the most urgent user globally to avoid total waste,
+                    # though a good Strategist shouldn't pick empty sectors (we mask them).
+                    active = np.where(self.needs > self.progress)[0]
+                    if len(active) > 0:
+                        selected_users[i] = active[np.argmax(self.needs[active] - self.progress[active])]
+                    else:
+                        selected_users[i] = 0
+
         else:
-            selected_users = action.astype(int)
+            if self.config['operation_mode'] == 'single':
+                uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
+                selected_users = np.full(self.num_arrays, uid, dtype=int)
+            elif isinstance(action, (int, np.integer)):
+                selected_users = np.full(self.num_arrays, int(action), dtype=int)
+            elif isinstance(action, np.ndarray) and action.ndim == 0:
+                selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
+            else:
+                selected_users = action.astype(int)
 
         # ---------------------------------------------------------------------
         # Option A: Soft Probabilistic Masking / Gambling
@@ -300,10 +343,28 @@ class UAVEnv(gym.Env):
     def get_action_mask(self):
         user_mask = (self.needs > self.progress).astype(bool)
 
+        if self.config.get('h_marl_mode', False):
+            # In H-MARL, the action space is sectors, not users.
+            # Mask out sectors that contain NO active users to avoid total waste.
+            sector_mask = np.zeros(self.num_sectors, dtype=bool)
+            sector_width = 360.0 / self.num_sectors
+
+            for u in range(self.num_users):
+                if user_mask[u]:
+                    _, phi = self._calculate_direction(self.locations[u])
+                    # phi is [-180, 180], map to [0, 360) then divide by width
+                    phi_mapped = (phi + 180.0) % 360.0
+                    s_idx = int(phi_mapped // sector_width)
+                    s_idx = min(s_idx, self.num_sectors - 1)
+                    sector_mask[s_idx] = True
+
+            if not np.any(sector_mask):
+                # Fallback if no users (shouldn't happen before done)
+                sector_mask[:] = True
+
+            return np.tile(sector_mask, self.num_arrays)
+
         if self.config.get('enable_spatial_masking', True):
-            # Call to ensure the latest mask components are updated, but we don't strictly need to do this
-            # if the mask logic doesn't depend on the side-effects of _get_observation.
-            # However, _get_observation sets _last_conflict_matrix, so we call it.
             self._get_observation()
             conflict_matrix = getattr(self, '_last_conflict_matrix', np.zeros(self.num_users * self.num_users)).reshape((self.num_users, self.num_users))
 
@@ -318,11 +379,9 @@ class UAVEnv(gym.Env):
             final_mask = user_mask
 
         if self.config.get('operation_mode', 'multi') == 'single':
-            return user_mask
+            return final_mask
         else:
-            # sb3_contrib MaskablePPO with MultiDiscrete expects flat array of shape
-            # (sum(nvec),) = (num_users * num_arrays,) — all dimension masks concatenated.
-            return np.tile(user_mask, self.num_arrays)
+            return np.tile(final_mask, self.num_arrays)
 
     def _get_observation(self):
         needs_remaining = np.maximum(self.needs - self.progress, 0.0)
