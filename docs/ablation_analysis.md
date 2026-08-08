@@ -60,3 +60,9 @@ This H-MARL structure proves our core theory: **Interference can be managed fund
 - **`evaluate_final.py`**: Updated to exclusively read `info['true_reward']` to report pure telecom performance.
 - **`configs/env_config.yaml`**: Added the `enable_spatial_masking` toggle to control whether the environment provides strict safety masks or pure gambling logic.
 - **`configs/train_config.yaml`**: Increased base timesteps to 300,000 to better accommodate the harder exploration landscape.
+
+## 6. The Final Architecture: Graph-Informed Surrogate Model
+After exploring the H-MARL sector approach, we determined that it artificially limited the hardware's capability. Instead, the final architecture relies on a **Pairwise Interference PINN (Physics-Informed Neural Network)**.
+- **Why it works:** The PINN acts as a digital twin for the cheap, quantized hardware. It is explicitly bound by the physical laws derived in our diagnostics (e.g., 1-bit mirror ambiguity, 2-bit harmonic sidelobes, and HPBW coupling).
+- **The RL Integration:** Instead of guessing trigonometry, the single RL agent observes an $N \times N$ Interference Matrix outputted by the PINN. This provides an explicit "Carrier Sense" graph, allowing the agent to navigate the 4096-action space by avoiding heavy interference edges.
+- **Result:** This approach preserves the decentralized, unmasked gambling environment but provides the RL agent with the required state space to learn and outperform blind heuristics.

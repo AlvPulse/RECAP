@@ -6,6 +6,7 @@ import numpy as np
 from src.uav_comm.components.channel import total_path_loss, calculate_noise_level_db
 from src.uav_comm.components.antenna import array_locs, pert2d_null_multi, phase_code_finder, find_gain_of_tphi
 from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
+from src.uav_comm.components.pinn_surrogate import PairwiseInterferencePINN
 
 DEFAULT_CONFIG = {
     'num_users': 8,
@@ -72,7 +73,13 @@ class UAVEnv(gym.Env):
             # Normalised SINR from the previous step: direct feedback on null-forming quality.
             # log2(1+SINR)/10 maps SINR=[0,500] → [0,0.9]; zero for unsatisfied/unserved users.
             'sinr_obs':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            # Hardware-Aware Physics Rule: PINN Surrogate Matrix for spatial conflict bounds
+            'pinn_interference_matrix': spaces.Box(low=0, high=1, shape=(self.num_users * self.num_users,), dtype=np.float64),
         })
+
+        # Initialize Surrogate
+        quant_bits = 1 if self.num_elements_regular <= 8 else 2 # Approximating bits based on elements
+        self.pinn_surrogate = PairwiseInterferencePINN(hpbw_deg=self.config.get('conflict_threshold_deg', 20.0), quantization_bits=quant_bits)
 
         self.reset()
 
@@ -442,7 +449,12 @@ class UAVEnv(gym.Env):
         sinr_obs = np.clip(np.log2(1.0 + self.sinr) / 10.0, 0.0, 1.0).astype(np.float64)
         sinr_obs[user_satisfied] = 0.0
 
-        # Store conflict matrix internally for other methods to access without polluting the Observation Space
+        # Hardware-Aware Penalty Matrix: Query PINN for the current geometry
+        # `directions` variable holds unnormalized phi in degrees inside this function,
+        # it is normalized to `directions / 360.0` only when building the return dict.
+        pinn_matrix = self.pinn_surrogate.get_interference_matrix(directions, distance * self.config['max_range'] * 2)
+
+        # Store deterministic mask internally for baseline algorithms and fallback masking
         self._last_conflict_matrix = conflict_matrix.flatten()
 
         return {
@@ -452,4 +464,5 @@ class UAVEnv(gym.Env):
             'user_satisfied': user_satisfied.astype(np.int8),
             'remaining_time': remaining_time,
             'sinr_obs':       sinr_obs,
+            'pinn_interference_matrix': pinn_matrix.flatten().astype(np.float64),
         }

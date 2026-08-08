@@ -1,33 +1,33 @@
-# Theoretical Framework: Physics-Informed Dynamic Action Masking for mmWave UAVs
+# Theoretical Framework: Physics-Informed Action Masking for Quantized UAV Arrays
 
 ## 1. The Core Concept and The Scalability Problem
-In a multi-panel mmWave UAV setup, we want to dynamically restrict the action space (which user each panel targets) based on physical interference boundaries. The problem seems cursed by dimensionality: Panel $i$'s ability to serve User $u$ while nulling interference toward all $K-1$ users chosen by other panels depends on the joint configuration. Tabulating or learning this joint feasibility appears exponential in $K$.
+In a multi-panel mmWave UAV setup, dynamic restriction of the action space (user selection) based on physical interference boundaries is critical. The problem of computing joint feasibility for $K$ arrays appears cursed by dimensionality. However, we escape this curse by establishing that **interference under quantized baseband control is deterministically bounded by predictable array physics.**
 
-## 2. The Theoretical Anchor: Mask-Induced Decoupling Lemma
-We escape the curse of dimensionality using classical physics and linear algebra.
+## 2. The Physics of Quantization Lobes and Angular Ambiguity
+When dealing with low-cost arrays employing 1-bit or 2-bit phase shifters, standard digital beamforming (e.g., Zero-Forcing or MMSE) fails catastrophically in specific spatial regions. This failure is not random; it is governed by exact geometric principles.
 
-For null constraints stacked in matrix $V$, the achievable gain toward $u$ is the projection $\|P_V^\perp a_u\|^2$. The coupling between constraints enters only through the **Gram matrix of the steering vectors**.
+### A. 1-Bit Angular Ambiguity (The Mirror Lobe)
+With 1-bit quantization (phases constrained to $0$ and $\pi$), the excitation weights become purely real-valued (or anti-aligned). Mathematically, this forces the complex array factor $AF(\theta, \phi)$ to have Hermitian symmetry.
+**The Physical Consequence:** For every main beam steered towards a target angle $(\theta, \phi)$, an exact "mirror" grating lobe of equal magnitude is unavoidably generated in the opposite direction space (e.g., $\phi \pm 180^\circ$).
+**The Action Rule:** It is physically impossible to isolate two users if they lie on this mirror-ambiguity line. The PINN must enforce a hard bound: if $User_1$ and $User_2$ are separated by $\approx 180^\circ$ azimuth, the expected interference penalty approaches 1.0 (total failure).
 
-1. **Mainlobe–Null Proximity is First-Order:** Gain collapses when a null direction is angularly close to the serve direction (pairwise proximity).
-2. **Null–Null Proximity is Benign (Second-Order):** If two null directions are close, their steering vectors are collinear—one spatial null covers both. The joint problem gets easier. Severely coupled regimes only occur at small separations, which our mask strictly forbids.
+### B. 2-Bit Quantization Sidelobes
+With 2-bit quantization (phases constrained to $0, \pi/2, \pi, 3\pi/2$), the mirror lobe is broken, but the periodic phase rounding introduces specific, predictable parasitic quantization lobes.
+**The Physical Consequence:** These lobes appear at predictable harmonic offsets from the main beam, depending on the array spacing $d$ and the steering angle. They set a strict, inescapable "Quantization Noise Floor" (typically -10 dB to -15 dB).
+**The Action Rule:** Deep nulls (e.g., -30 dB) are physically impossible. The PINN will bound the maximum pairwise isolation based on this noise floor. If User B lies anywhere near one of the primary quantization harmonic angles of User A, the PINN must penalize the selection.
 
-**The Lemma:** *If the pairwise mask enforces angular separation beyond the Half-Power Beamwidth (HPBW) between every serve direction and every null direction, the steering-vector Gram matrix is diagonally dominant. Joint feasibility deviates from the product of pairwise feasibilities by a bounded $\epsilon$ (a Gershgorin-type bound).*
+## 3. The Rank Exhaustion Constraint (DoF)
+Beyond spatial ambiguity, small arrays suffer from **Degrees of Freedom (DoF) Exhaustion**. An $N$-element array mathematically has $N-1$ degrees of freedom. Forcing it to null multiple users under coarse quantization rapidly exhausts this budget, collapsing the mainlobe regardless of angular separation.
 
-## 3. The DoF-Budget (Rank) Constraint
-While the Decoupling Lemma handles angular proximity, small arrays (e.g., 8-element) suffer from **Degrees of Freedom (DoF) Exhaustion**. An $N$-element array has $N-1$ degrees of freedom. Forcing it to null multiple users under coarse (1-bit or 2-bit) phase quantization rapidly exhausts this budget, collapsing the mainlobe regardless of angular separation.
+**The Action Rule:** A cardinality limit must be enforced. The model will cap the maximum number of simultaneously served users in a given sector before the joint SINR fundamentally collapses.
 
-This is a **deterministic, non-combinatorial limit**. We augment the pairwise mask with a **DoF-Budget Constraint**: the spatial rank of the simultaneous null constraints must not exceed the effective quantized rank limit of the panel.
+## 4. Constructing the PINN Surrogate Model
+Instead of full joint simulations, we train a Physics-Informed Neural Network (PINN) to act as a pairwise surrogate model.
+*   **Inputs:** $(\Delta \theta, \Delta \phi, R_1/R_2, \text{Quantization\_Bits})$
+*   **Physics Loss Functions:** The PINN loss includes mathematical regularizers:
+    *   `Loss_Mirror`: Enforces $Penalty(\Delta \phi \approx 180^\circ | \text{1-bit}) = 1.0$
+    *   `Loss_HPBW`: Enforces $Penalty(\Delta \phi < \text{HPBW}) = 1.0$
+    *   `Loss_NoiseFloor`: Enforces $Penalty \ge \text{Quantization\_Noise\_Floor}$
+*   **Output:** Joint SINR Retention Score $\in [0, 1]$.
 
-## 4. The Architecture: M-D Generator & E-C Executor
-
-### The Mask Generator (M-D: Structured Hybrid)
-The mask is a union of three layers:
-1. **M-A (Deterministic Pairwise Core):** A feasibility table based on angular separation (HPBW + first-null width).
-2. **M-DoF (Cardinality Limit):** A strict block on joint actions that exceed the effective rank capability of the hardware.
-3. **M-B (Violation-Driven Growth):** Absorbs residual unmodeled effects (e.g., unpredictable quantization lobes). Includes **Asymmetric $\epsilon$-Probing** to explicitly test boundaries and prevent "Capacity Collapse."
-
-### The Executor (E-C: One-Shot Conservative Masking with Repair)
-Because standard PPO per-head masks cannot express joint conditional constraints natively:
-1. **One-Shot Masking:** We mask the *union* of pairwise forbidden regions.
-2. **Deterministic Repair:** We implement a deterministic repair step in the environment. If a sampled joint action violates the pairwise or DoF constraints, a fixed-priority order reassigns the lower-priority panel.
-3. **Validation:** By tracking the **empirical conflict repair rate** under a trained policy, we directly prove that the Decoupling Lemma holds (repairs approach zero as the policy respects the 1D conservative mask boundaries).
+By using this PINN, the RL agent operates entirely aware of the hardware's exact physical limits without running computationally expensive baseband simulations during training.

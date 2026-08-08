@@ -196,7 +196,7 @@ def evaluate_final():
                     vec_env.training = False; vec_env.norm_reward = False
                 else:
                     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0,
-                        norm_obs_keys=['needs','directions','distance','remaining_time','sinr_obs'])
+                        norm_obs_keys=['needs','directions','distance','remaining_time','sinr_obs','pinn_interference_matrix'])
                 rl_model = MaskablePPO.load(ck_model, env=vec_env)
                 rl_available = True
                 vn_note = "(with saved VecNorm)" if ck_vn else "(fresh VecNorm — approximate)"

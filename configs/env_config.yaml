@@ -23,5 +23,5 @@ rx_gain_dbi: 0
 enable_spatial_masking: false # If false, only masks out users that are already satisfied
 
 # H-MARL Architecture
-h_marl_mode: true       # Strategist assigns sectors instead of specific users
+h_marl_mode: false       # Strategist assigns sectors instead of specific users
 num_sectors: 4          # Number of angular sectors (e.g. 0-90, 90-180, etc.)
