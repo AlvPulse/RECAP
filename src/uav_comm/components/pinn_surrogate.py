@@ -28,20 +28,29 @@ class PairwiseInterferencePINN(nn.Module):
         dp = torch.minimum(dp, 360.0 - dp) # Map to [0, 180]
 
         # Rule 1: HPBW Coupling Bound
-        # If angles are closer than HPBW, score drops to 0 (total interference)
-        hpbw_mask = torch.sigmoid((dp - self.hpbw_deg) * 2.0)
+        # The true physics engine collapses capacity very aggressively.
+        # Using a sharper slope (4.0 instead of 2.0) and shifting the midpoint
+        # to effectively capture the wide sidelobe interference penalty.
+        hpbw_mask = torch.sigmoid((dp - (self.hpbw_deg * 1.5)) * 4.0)
 
         # Rule 2: 1-Bit Mirror Ambiguity
         if self.quantization_bits == 1:
             mirror_diff = torch.abs(dp - 180.0)
-            mirror_mask = torch.sigmoid((mirror_diff - self.hpbw_deg) * 2.0)
-            score = hpbw_mask * mirror_mask
+            mirror_mask = torch.sigmoid((mirror_diff - (self.hpbw_deg * 1.5)) * 4.0)
+
+            # The base capacity retention for 1-bit arrays across random angles is extremely low
+            # (often < 0.1) due to the massive -10dB sidelobe plateau.
+            # We scale the maximum possible retention down severely.
+            base_retention_max = 0.15
+            score = hpbw_mask * mirror_mask * base_retention_max
         else:
             # Rule 3: 2-Bit Harmonic Lobe (Approx at 50 deg from tests)
             harmonic_diff = torch.abs(dp - 50.0)
-            harmonic_mask = torch.sigmoid((harmonic_diff - (self.hpbw_deg/2)) * 2.0)
-            # Harmonic lobe isn't total destruction, just severe degradation
-            score = hpbw_mask * (harmonic_mask * 0.7 + 0.3)
+            harmonic_mask = torch.sigmoid((harmonic_diff - self.hpbw_deg) * 4.0)
+
+            base_retention_max = 0.40 # 2-bit is better, but still leaks heavily
+            # Harmonic lobe creates a severe dip in the retention
+            score = hpbw_mask * (harmonic_mask * 0.8 + 0.2) * base_retention_max
 
         # Rule 4: Distance coupling & Quantization Noise Floor
         # Even at perfect angles, noise floor limits isolation
