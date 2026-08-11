@@ -37,8 +37,7 @@ def run_baseline_episode(env, action_fn, seed):
     while not done and not truncated:
         action = action_fn()
         obs, reward, done, truncated, info = env.step(action)
-        # Use true_reward for evaluation to ignore behavioral shapings
-        total_reward += info.get('true_reward', reward)
+        total_reward += reward
         step += 1
 
     n_users = env.num_users
@@ -90,11 +89,7 @@ def run_rl_episode(model, vec_env, seed, max_steps=120):
         if info and len(info) > 0 and "conflict_repaired" in info[0]:
             conflict_repairs += info[0]["conflict_repaired"]
         
-        if info and len(info) > 0 and "true_reward" in info[0]:
-            total_reward += float(info[0]["true_reward"])
-        else:
-            total_reward += float(reward[0])
-
+        total_reward += float(reward[0])
         if done_arr[0]:
             all_done = True
             break
@@ -196,7 +191,7 @@ def evaluate_final():
                     vec_env.training = False; vec_env.norm_reward = False
                 else:
                     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0,
-                        norm_obs_keys=['needs','directions','distance','remaining_time','sinr_obs','pinn_interference_matrix'])
+                        norm_obs_keys=['needs','directions','distance','remaining_time','sinr_obs'])
                 rl_model = MaskablePPO.load(ck_model, env=vec_env)
                 rl_available = True
                 vn_note = "(with saved VecNorm)" if ck_vn else "(fresh VecNorm — approximate)"
@@ -209,63 +204,39 @@ def evaluate_final():
         print("WARNING: No RL model found — RL column will be skipped. Run train_multi_user.py first.\n")
 
     # ── Algorithm catalogue ────────────────────────────────────────────────────
-    # We want to test H-MARL against previous heuristic planners directly.
-    # To do this safely, we will evaluate the previous planners using a standard environment
-    # (h_marl_mode = False), and the H-MARL baselines/RL on the current h_marl_mode environment.
-
-    # 1. Standard Baselines (h_marl_mode = False)
-    standard_config = env_config.copy()
-    standard_config['h_marl_mode'] = False
-    std_env = UAVEnv(config=standard_config)
-    std_bl = MultiUserBaselines(std_env)
-
-    std_algorithms = [
+    # Each entry: (label, category, action_fn)
+    algorithms = [
         # Single-user baselines (all arrays → one user)
-        ("S-Random",   "Single", lambda: std_bl.single_random()),
-        ("S-FCFS",     "Single", lambda: std_bl.single_fcfs()),
-        ("S-Greedy",   "Single", lambda: std_bl.single_greedy()),
-        ("S-RR",       "Single", lambda: std_bl.single_round_robin()),
-        ("S-PF",       "Single", lambda: std_bl.single_proportional_fair()),
-        ("S-LWDF",     "Single", lambda: std_bl.single_lwdf()),
-        ("S-MaxMin",   "Single", lambda: std_bl.single_max_min()),
+        ("S-Random",   "Single", lambda: bl.single_random()),
+        ("S-FCFS",     "Single", lambda: bl.single_fcfs()),
+        ("S-Greedy",   "Single", lambda: bl.single_greedy()),
+        ("S-RR",       "Single", lambda: bl.single_round_robin()),
+        ("S-PF",       "Single", lambda: bl.single_proportional_fair()),
+        ("S-LWDF",     "Single", lambda: bl.single_lwdf()),
+        ("S-MaxMin",   "Single", lambda: bl.single_max_min()),
         # Multi-user baselines (each array independent)
-        ("M-Random",   "Multi",  lambda: std_bl.multi_random()),
-        ("M-FCFS",     "Multi",  lambda: std_bl.multi_fcfs()),
-        ("M-Greedy",   "Multi",  lambda: std_bl.multi_greedy()),
-        ("M-RR",       "Multi",  lambda: std_bl.multi_round_robin()),
-        ("M-PF",       "Multi",  lambda: std_bl.multi_proportional_fair()),
-        ("M-LWDF",     "Multi",  lambda: std_bl.multi_lwdf()),
-        ("M-MaxMin",   "Multi",  lambda: std_bl.multi_max_min()),
+        ("M-Random",   "Multi",  lambda: bl.multi_random()),
+        ("M-FCFS",     "Multi",  lambda: bl.multi_fcfs()),
+        ("M-Greedy",   "Multi",  lambda: bl.multi_greedy()),
+        ("M-RR",       "Multi",  lambda: bl.multi_round_robin()),
+        ("M-PF",       "Multi",  lambda: bl.multi_proportional_fair()),
+        ("M-LWDF",     "Multi",  lambda: bl.multi_lwdf()),
+        ("M-MaxMin",   "Multi",  lambda: bl.multi_max_min()),
         # Angular-separation-aware greedy (strongest non-RL multi baseline)
-        ("M-Angular",  "Multi",   lambda: std_bl.multi_angular_greedy()),
+        ("M-Angular",  "Multi",   lambda: bl.multi_angular_greedy()),
     ]
 
     results = {}
 
-    # ── Run Standard baselines ─────────────────────────────────────────────────
-    for label, category, action_fn in std_algorithms:
+    # ── Run baselines ─────────────────────────────────────────────────────────
+    for label, category, action_fn in algorithms:
         print(f"  Evaluating {label} ...")
         ep_results = []
         for i in range(N_EPISODES):
-            std_bl.reset()  # clear RR counter and PF EMA
-            ep = run_baseline_episode(std_env, action_fn, seed=i)
+            bl.reset()  # clear RR counter and PF EMA
+            ep = run_baseline_episode(raw_env, action_fn, seed=i)
             ep_results.append(ep)
         results[label] = ep_results
-
-    # ── Run H-MARL baselines ───────────────────────────────────────────────────
-    if env_config.get('h_marl_mode', False):
-        hmarl_algorithms = [
-            ("HMARL-Static", "H-MARL", lambda: bl.hmarl_static()),
-            ("HMARL-Random", "H-MARL", lambda: bl.hmarl_random()),
-        ]
-        for label, category, action_fn in hmarl_algorithms:
-            print(f"  Evaluating {label} ...")
-            ep_results = []
-            for i in range(N_EPISODES):
-                bl.reset()
-                ep = run_baseline_episode(raw_env, action_fn, seed=i)
-                ep_results.append(ep)
-            results[label] = ep_results
 
     # ── Run RL ────────────────────────────────────────────────────────────────
     if rl_available:
