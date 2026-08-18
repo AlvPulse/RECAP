@@ -65,7 +65,7 @@ def train():
             norm_obs=True,
             norm_reward=True,
             clip_obs=10.0,
-            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs'],
+            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs', 'pinn_interference_matrix'],
         )
 
         print("Initialising MaskablePPO...")
