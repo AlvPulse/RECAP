@@ -21,6 +21,7 @@ rx_gain_dbi: 0
 
 # Ablation Testing
 enable_spatial_masking: false # If false, only masks out users that are already satisfied
+enable_reward_weighted_positioning: true # If true, UAV mobility is guided by user urgency weights
 
 # H-MARL Architecture
 h_marl_mode: false       # Strategist assigns sectors instead of specific users

@@ -13,7 +13,7 @@ sys.path.append(os.getcwd())
 from src.uav_comm.envs.core import UAVEnv
 from src.uav_comm.agents.baselines import MultiUserBaselines
 
-N_EPISODES = 2
+N_EPISODES = 30
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Episode runner helpers
@@ -238,7 +238,7 @@ def evaluate_final():
         ("M-MaxMin",   "Multi",  lambda: std_bl.multi_max_min()),
         # Angular-separation-aware greedy (strongest non-RL multi baseline)
         ("M-Angular",  "Multi",   lambda: std_bl.multi_angular_greedy()),
-        # PINN-Aware Baseline
+        # PINN-Aware Baseline (proving utility of surrogate matrix)
         ("M-PINN-Greedy", "Multi", lambda: std_bl.multi_pinn_greedy()),
     ]
 
@@ -257,14 +257,14 @@ def evaluate_final():
     # ── Run H-MARL baselines ───────────────────────────────────────────────────
     if env_config.get('h_marl_mode', False):
         hmarl_algorithms = [
-            ("HMARL-Static", "H-MARL", lambda: bl.hmarl_static()),
-            ("HMARL-Random", "H-MARL", lambda: bl.hmarl_random()),
+            ("HMARL-Static", "H-MARL", lambda: std_bl.hmarl_static()),
+            ("HMARL-Random", "H-MARL", lambda: std_bl.hmarl_random()),
         ]
         for label, category, action_fn in hmarl_algorithms:
             print(f"  Evaluating {label} ...")
             ep_results = []
             for i in range(N_EPISODES):
-                bl.reset()
+                std_bl.reset()
                 ep = run_baseline_episode(raw_env, action_fn, seed=i)
                 ep_results.append(ep)
             results[label] = ep_results

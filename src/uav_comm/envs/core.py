@@ -330,9 +330,29 @@ class UAVEnv(gym.Env):
         return np.array(dirs), np.array(dists)
 
     def _update_uav_location(self, selected_users):
-        targets = [self._calculate_optimal_location(uid) for uid in np.unique(selected_users)]
+        unique_users = np.unique(selected_users)
+        targets = [self._calculate_optimal_location(uid) for uid in unique_users]
+
         if targets:
-            avg = np.mean(targets, axis=0)
+            if self.config.get('enable_reward_weighted_positioning', True):
+                # Calculate urgency weights: (delay + 1) * remaining_need
+                remaining = np.maximum(self.needs - self.progress, 0.0)
+                urgency = (self.delay + 1.0) * remaining
+
+                weights = np.array([urgency[uid] for uid in unique_users])
+                sum_weights = np.sum(weights)
+
+                if sum_weights > 1e-6:
+                    weights = weights / sum_weights
+                    # Compute weighted centroid
+                    avg = np.average(targets, axis=0, weights=weights)
+                else:
+                    # Fallback to simple average if no urgent users
+                    avg = np.mean(targets, axis=0)
+            else:
+                # Standard unweighted centroid
+                avg = np.mean(targets, axis=0)
+
             d = avg - self.uav_position
             norm = np.linalg.norm(d)
             if norm > 1e-6:
