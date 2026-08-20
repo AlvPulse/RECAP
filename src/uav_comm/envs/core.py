@@ -48,6 +48,9 @@ class UAVEnv(gym.Env):
         self.uav_user_gain = 10 ** ((tx_dbm + rx_dbi) / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
+        # Curriculum Learning state (updated externally by a callback)
+        self.curriculum_progress = 0.0 # 0.0 at start of training, 1.0 at end
+
         # Heterogeneous Hardware: alternate between regular and irregular panels
         self.array_configs = []
         for i in range(self.num_arrays):
@@ -206,16 +209,18 @@ class UAVEnv(gym.Env):
         if self.last_action is not None and not np.array_equal(action, self.last_action):
             train_reward -= self.config['switch_cost'] / 10.0
 
-        # 3. Gambling/Interference Penalty:
+        # 3. Gambling/Interference Penalty (Curriculum Scaled):
         # If an agent tried to serve a user but failed (0 throughput) due to interference
         # (SINR < threshold), apply a sharp penalty to teach them to avoid overlapping beams.
+        # We scale this penalty from 0.0 -> 1.5 as training progresses to prevent early exploration paralysis.
         failed_gambles = 0
         for uid in np.unique(selected_users):
             if active_users[uid] and throughputs_per_user[uid] == 0:
                 failed_gambles += 1
 
         if failed_gambles > 0:
-            train_reward -= (failed_gambles * 1.5) / 10.0
+            current_penalty_weight = 1.5 * self.curriculum_progress
+            train_reward -= (failed_gambles * current_penalty_weight) / 10.0
 
         self.last_action = np.copy(action) if isinstance(action, np.ndarray) else action
 

@@ -5,6 +5,25 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 from src.uav_comm.utils.visualizer import EpisodeVisualizer
 
+class CurriculumCallback(BaseCallback):
+    """
+    Updates the environment's internal `curriculum_progress` variable from 0.0 to 1.0
+    based on the total training timesteps. This allows the environment to smoothly
+    scale penalties (e.g., the gambling interference penalty) to prevent early
+    exploration paralysis.
+    """
+    def __init__(self, total_timesteps, verbose=0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+
+    def _on_step(self) -> bool:
+        progress = min(self.num_timesteps / self.total_timesteps, 1.0)
+        # Update the curriculum parameter in all parallel environments
+        for env in self.training_env.envs:
+            env.unwrapped.curriculum_progress = progress
+        return True
+
+
 class GifEvalCallback(BaseCallback):
     """
     Evaluates the current policy every `eval_freq` steps and generates a GIF

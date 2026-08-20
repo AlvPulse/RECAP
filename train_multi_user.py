@@ -13,7 +13,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 sys.path.append(os.getcwd())
 
 from src.uav_comm.envs.core import UAVEnv
-from src.uav_comm.utils.callbacks import MLflowCallback, VecNormalizeCheckpointCallback, GifEvalCallback
+from src.uav_comm.utils.callbacks import MLflowCallback, VecNormalizeCheckpointCallback, GifEvalCallback, CurriculumCallback
 
 
 def load_train_config(config_path="configs/train_config.yaml"):
@@ -120,7 +120,9 @@ def train():
             save_path="diagnostics/gifs"
         )
 
-        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, vecnorm_cb, mlflow_cb, gif_cb])
+        curriculum_cb = CurriculumCallback(total_timesteps=total_steps)
+
+        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, vecnorm_cb, mlflow_cb, gif_cb, curriculum_cb])
 
         print("Saving model...")
         os.makedirs("models", exist_ok=True)
