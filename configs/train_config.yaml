@@ -5,8 +5,8 @@ policy_kwargs:
   optimizer_kwargs:
     weight_decay: 0.00001
 
-n_envs: 1            # parallel environments (multiplies batch diversity)
-n_steps: 1024        # steps per env per rollout; effective batch = n_steps * n_envs = 8192
+n_envs: 4            # parallel environments (multiplies batch diversity)
+n_steps: 2048        # steps per env per rollout; effective batch = n_steps * n_envs = 8192
 batch_size: 256      # mini-batch size for gradient updates
 learning_rate: 0.0003
 clip_range: 0.2
