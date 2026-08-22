@@ -15,4 +15,4 @@ vf_coef: 0.5
 gae_lambda: 0.95
 gamma: 0.99
 n_epochs: 10
-total_timesteps: 1000000
+total_timesteps: 300000

@@ -13,7 +13,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 sys.path.append(os.getcwd())
 
 from src.uav_comm.envs.core import UAVEnv
-from src.uav_comm.utils.callbacks import MLflowCallback, VecNormalizeCheckpointCallback
+from src.uav_comm.utils.callbacks import MLflowCallback, VecNormalizeCheckpointCallback, GifEvalCallback, CurriculumCallback
 
 
 def load_train_config(config_path="configs/train_config.yaml"):
@@ -65,7 +65,7 @@ def train():
             norm_obs=True,
             norm_reward=True,
             clip_obs=10.0,
-            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs'],
+            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs', 'pinn_interference_matrix'],
         )
 
         print("Initialising MaskablePPO...")
@@ -102,7 +102,27 @@ def train():
         )
         mlflow_cb = MLflowCallback()
 
-        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, vecnorm_cb, mlflow_cb])
+        # Create an exact clone of the training environment for evaluation/GIF generation
+        eval_env = DummyVecEnv([make_env])
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=True,
+            norm_reward=False, # We don't normalize rewards during evaluation
+            clip_obs=10.0,
+            norm_obs_keys=['needs', 'directions', 'distance', 'remaining_time', 'sinr_obs', 'pinn_interference_matrix'],
+        )
+        # Keep eval_env synchronized with training env's running stats
+        eval_env.training = False
+
+        gif_cb = GifEvalCallback(
+            eval_env=eval_env,
+            eval_freq=max(10_000 // n_envs, 1), # Generate a GIF every 10k steps for debugging
+            save_path="diagnostics/gifs"
+        )
+
+        curriculum_cb = CurriculumCallback(total_timesteps=total_steps)
+
+        model.learn(total_timesteps=total_steps, callback=[checkpoint_cb, vecnorm_cb, mlflow_cb, gif_cb, curriculum_cb])
 
         print("Saving model...")
         os.makedirs("models", exist_ok=True)

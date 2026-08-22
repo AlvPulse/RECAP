@@ -6,6 +6,7 @@ import numpy as np
 from src.uav_comm.components.channel import total_path_loss, calculate_noise_level_db
 from src.uav_comm.components.antenna import array_locs, pert2d_null_multi, phase_code_finder, find_gain_of_tphi
 from src.uav_comm.components.rewards import calculate_reward_function, MAX_NEED
+from src.uav_comm.components.pinn_surrogate import PairwiseInterferencePINN
 
 DEFAULT_CONFIG = {
     'num_users': 8,
@@ -47,16 +48,24 @@ class UAVEnv(gym.Env):
         self.uav_user_gain = 10 ** ((tx_dbm + rx_dbi) / 10)
         self.sinr_threshold_linear = 10 ** (self.config['sinr_threshold_db'] / 10)
 
+        # Curriculum Learning state (updated externally by a callback)
+        self.curriculum_progress = 0.0 # 0.0 at start of training, 1.0 at end
+
         # Heterogeneous Hardware: alternate between regular and irregular panels
         self.array_configs = []
         for i in range(self.num_arrays):
             num_el = self.num_elements_regular if i % 2 == 0 else self.num_elements_irregular
             self.array_configs.append(array_locs(num_el))
 
-        if self.config['operation_mode'] == 'single':
-            self.action_space = spaces.Discrete(self.num_users)
+        if self.config.get('h_marl_mode', False):
+            # Strategist assigns one of num_sectors to each array
+            self.num_sectors = self.config.get('num_sectors', 4)
+            self.action_space = spaces.MultiDiscrete([self.num_sectors] * self.num_arrays)
         else:
-            self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
+            if self.config['operation_mode'] == 'single':
+                self.action_space = spaces.Discrete(self.num_users)
+            else:
+                self.action_space = spaces.MultiDiscrete([self.num_users] * self.num_arrays)
 
         self.observation_space = spaces.Dict({
             'needs':          spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
@@ -67,7 +76,13 @@ class UAVEnv(gym.Env):
             # Normalised SINR from the previous step: direct feedback on null-forming quality.
             # log2(1+SINR)/10 maps SINR=[0,500] → [0,0.9]; zero for unsatisfied/unserved users.
             'sinr_obs':       spaces.Box(low=0, high=1, shape=(self.num_users,), dtype=np.float64),
+            # Hardware-Aware Physics Rule: PINN Surrogate Matrix for spatial conflict bounds
+            'pinn_interference_matrix': spaces.Box(low=0, high=1, shape=(self.num_users * self.num_users,), dtype=np.float64),
         })
+
+        # Initialize Surrogate
+        quant_bits = 1 if self.num_elements_regular <= 8 else 2 # Approximating bits based on elements
+        self.pinn_surrogate = PairwiseInterferencePINN(hpbw_deg=self.config.get('conflict_threshold_deg', 20.0), quantization_bits=quant_bits)
 
         self.reset()
 
@@ -99,50 +114,62 @@ class UAVEnv(gym.Env):
         conflict_repaired = False
 
         # Resolve per-array user assignments
-        if self.config['operation_mode'] == 'single':
-            uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
-            selected_users = np.full(self.num_arrays, uid, dtype=int)
-        elif isinstance(action, (int, np.integer)):
-            selected_users = np.full(self.num_arrays, int(action), dtype=int)
-        elif isinstance(action, np.ndarray) and action.ndim == 0:
-            selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
+        if self.config.get('h_marl_mode', False):
+            # action is an array of sector indices for each antenna array
+            sectors = action.astype(int)
+            selected_users = np.zeros(self.num_arrays, dtype=int)
+
+            # Fast-timescale distributed Actor logic: pick highest urgency user in assigned sector
+            sector_width = 360.0 / self.num_sectors
+
+            for i in range(self.num_arrays):
+                target_sector = sectors[i]
+                start_angle = target_sector * sector_width - 180.0
+                end_angle = (target_sector + 1) * sector_width - 180.0
+
+                # Directions observation is normalized from actual phi [-180, 180]
+                # Let's map it back to physical phi bounds for sector assignment.
+                phis = np.zeros(self.num_users)
+                for u in range(self.num_users):
+                    _, phis[u] = self._calculate_direction(self.locations[u])
+
+                valid_users = []
+                for u in range(self.num_users):
+                    if self.needs[u] > self.progress[u] and start_angle <= phis[u] < end_angle:
+                        valid_users.append(u)
+
+                if valid_users:
+                    # Actor heuristically picks the user with the most remaining need in its sector
+                    remaining_needs = self.needs[valid_users] - self.progress[valid_users]
+                    selected_users[i] = valid_users[np.argmax(remaining_needs)]
+                else:
+                    # If sector is empty, fallback to the most urgent user globally to avoid total waste,
+                    # though a good Strategist shouldn't pick empty sectors (we mask them).
+                    active = np.where(self.needs > self.progress)[0]
+                    if len(active) > 0:
+                        selected_users[i] = active[np.argmax(self.needs[active] - self.progress[active])]
+                    else:
+                        selected_users[i] = 0
+
         else:
-            selected_users = action.astype(int)
+            if self.config['operation_mode'] == 'single':
+                uid = int(action.item()) if isinstance(action, np.ndarray) else int(action)
+                selected_users = np.full(self.num_arrays, uid, dtype=int)
+            elif isinstance(action, (int, np.integer)):
+                selected_users = np.full(self.num_arrays, int(action), dtype=int)
+            elif isinstance(action, np.ndarray) and action.ndim == 0:
+                selected_users = np.full(self.num_arrays, int(action.item()), dtype=int)
+            else:
+                selected_users = action.astype(int)
 
         # ---------------------------------------------------------------------
-        # E-C Executor: Deterministic Repair Step
+        # Option A: Soft Probabilistic Masking / Gambling
         # ---------------------------------------------------------------------
-        if self.config['operation_mode'] == 'multi':
-            obs = self._get_observation()
-            conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
-            valid_mask = self.get_action_mask()
-            user_mask = valid_mask[:self.num_users]
-
-            for i in range(len(selected_users)):
-                for j in range(i + 1, len(selected_users)):
-                    uid_i = selected_users[i]
-                    uid_j = selected_users[j]
-
-                    if uid_i != uid_j and conflict_matrix[uid_i, uid_j] == 1:
-                        conflict_repaired = True
-                        available_users = np.where(user_mask)[0]
-
-                        safe_users = []
-                        for candidate in available_users:
-                            is_safe = True
-                            for k in range(i + 1):
-                                if conflict_matrix[candidate, selected_users[k]] == 1:
-                                    is_safe = False
-                                    break
-                            if is_safe:
-                                safe_users.append(candidate)
-
-                        if len(safe_users) > 0:
-                            remaining_needs = self.needs[safe_users] - self.progress[safe_users]
-                            best_candidate = safe_users[np.argmax(remaining_needs)]
-                            selected_users[j] = best_candidate
-                        else:
-                            selected_users[j] = selected_users[i]
+        # We no longer force a deterministic repair. Agents (including baselines)
+        # must gamble on their chosen assignments. If they pick conflicting users,
+        # the underlying physics engine (_calculate_sinr) will naturally yield a
+        # poor SINR, resulting in 0 throughput. This allows the RL to learn
+        # the optimal trade-off natively.
 
         self._calculate_sinr(selected_users)
 
@@ -163,30 +190,47 @@ class UAVEnv(gym.Env):
             self.delay, self.progress, self.needs, active_users
         )
 
-        # Safety net: penalise targeting already-satisfied users (masking should prevent this).
+        # ---------------------------------------------------------------------
+        # Reward Engineering: True Reward vs. Behavioral Shaping (Train Reward)
+        # ---------------------------------------------------------------------
+        # True Reward: Strictly based on system performance (throughput, fairness, completion)
+        true_reward = raw_reward / 10.0
+
+        # Behavioral Shaping (Train Reward): Add penalties for gambling failures
+        train_reward = true_reward
+
+        # 1. Safety net: penalise targeting already-satisfied users
         inactive = np.where(~active_users)[0]
         wrong_count = int(np.sum(np.isin(selected_users, inactive)))
         if wrong_count > 0:
-            raw_reward -= wrong_count * 2
+            train_reward -= (wrong_count * 2) / 10.0
 
-        # Switch cost applied at raw scale (consistent with /10 below)
+        # 2. Switch cost
         if self.last_action is not None and not np.array_equal(action, self.last_action):
-            raw_reward -= self.config['switch_cost']
+            train_reward -= self.config['switch_cost'] / 10.0
+
+        # 3. Gambling/Interference Penalty (Curriculum Scaled):
+        # If an agent tried to serve a user but failed (0 throughput) due to interference
+        # (SINR < threshold), apply a sharp penalty to teach them to avoid overlapping beams.
+        # We scale this penalty from 0.0 -> 1.5 as training progresses to prevent early exploration paralysis.
+        failed_gambles = 0
+        for uid in np.unique(selected_users):
+            if active_users[uid] and throughputs_per_user[uid] == 0:
+                failed_gambles += 1
+
+        if failed_gambles > 0:
+            current_penalty_weight = 1.5 * self.curriculum_progress
+            train_reward -= (failed_gambles * current_penalty_weight) / 10.0
 
         self.last_action = np.copy(action) if isinstance(action, np.ndarray) else action
 
-        reward = raw_reward / 10
-
-        # # New-needs logic — disabled: self.needs is never 0 after reset, so this never fires.
-        # if np.random.rand() < 0.2:
-        #     if len(inactive) > 0:
-        #         idx = np.random.choice(inactive)
-        #         if self.needs[idx] == 0:
-        #             self._declare_need(idx)
-
         done = bool(np.all(self.progress >= self.needs))
+
+        # Completion Bonus (Applied to both)
         if done:
-            reward += 0.0002 * (self.config['max_episode_time'] - self.current_time) ** 2
+            completion_bonus = 0.0002 * (self.config['max_episode_time'] - self.current_time) ** 2
+            true_reward += completion_bonus
+            train_reward += completion_bonus
 
         truncated = self.current_time >= self.config['max_episode_time']
 
@@ -194,11 +238,13 @@ class UAVEnv(gym.Env):
             "sinr_quality": float(sinr_quality),
             "urgency_thr":  float(urgency_thr),
             "min_progress": float(min_progress),
-            "total_thr": float(total_thr),
+            "total_thr": float(np.sum(throughputs_per_user)),
             "conflict_repaired": int(conflict_repaired),
+            "true_reward": float(true_reward), # Pure telecom evaluation metric
         }
 
-        return self._get_observation(), reward, done, truncated, info
+        # Return the shaped train_reward to the RL agent
+        return self._get_observation(), train_reward, done, truncated, info
 
     def _declare_need(self, user_idx):
         self.needs[user_idx] = MAX_NEED
@@ -289,9 +335,29 @@ class UAVEnv(gym.Env):
         return np.array(dirs), np.array(dists)
 
     def _update_uav_location(self, selected_users):
-        targets = [self._calculate_optimal_location(uid) for uid in np.unique(selected_users)]
+        unique_users = np.unique(selected_users)
+        targets = [self._calculate_optimal_location(uid) for uid in unique_users]
+
         if targets:
-            avg = np.mean(targets, axis=0)
+            if self.config.get('enable_reward_weighted_positioning', True):
+                # Calculate urgency weights: (delay + 1) * remaining_need
+                remaining = np.maximum(self.needs - self.progress, 0.0)
+                urgency = (self.delay + 1.0) * remaining
+
+                weights = np.array([urgency[uid] for uid in unique_users])
+                sum_weights = np.sum(weights)
+
+                if sum_weights > 1e-6:
+                    weights = weights / sum_weights
+                    # Compute weighted centroid
+                    avg = np.average(targets, axis=0, weights=weights)
+                else:
+                    # Fallback to simple average if no urgent users
+                    avg = np.mean(targets, axis=0)
+            else:
+                # Standard unweighted centroid
+                avg = np.mean(targets, axis=0)
+
             d = avg - self.uav_position
             norm = np.linalg.norm(d)
             if norm > 1e-6:
@@ -309,23 +375,45 @@ class UAVEnv(gym.Env):
     def get_action_mask(self):
         user_mask = (self.needs > self.progress).astype(bool)
 
-        obs = self._get_observation()
-        conflict_matrix = obs['conflict_matrix'].reshape((self.num_users, self.num_users))
+        if self.config.get('h_marl_mode', False):
+            # In H-MARL, the action space is sectors, not users.
+            # Mask out sectors that contain NO active users to avoid total waste.
+            sector_mask = np.zeros(self.num_sectors, dtype=bool)
+            sector_width = 360.0 / self.num_sectors
 
-        active_conflicts = (conflict_matrix > 0) & np.outer(user_mask, user_mask)
-        unsafe_users = np.any(active_conflicts, axis=1)
+            for u in range(self.num_users):
+                if user_mask[u]:
+                    _, phi = self._calculate_direction(self.locations[u])
+                    # phi is [-180, 180], map to [0, 360) then divide by width
+                    phi_mapped = (phi + 180.0) % 360.0
+                    s_idx = int(phi_mapped // sector_width)
+                    s_idx = min(s_idx, self.num_sectors - 1)
+                    sector_mask[s_idx] = True
 
-        final_mask = user_mask & (~unsafe_users)
+            if not np.any(sector_mask):
+                # Fallback if no users (shouldn't happen before done)
+                sector_mask[:] = True
 
-        if not np.any(final_mask) and np.any(user_mask):
+            return np.tile(sector_mask, self.num_arrays)
+
+        if self.config.get('enable_spatial_masking', True):
+            self._get_observation()
+            conflict_matrix = getattr(self, '_last_conflict_matrix', np.zeros(self.num_users * self.num_users)).reshape((self.num_users, self.num_users))
+
+            active_conflicts = (conflict_matrix > 0) & np.outer(user_mask, user_mask)
+            unsafe_users = np.any(active_conflicts, axis=1)
+
+            final_mask = user_mask & (~unsafe_users)
+
+            if not np.any(final_mask) and np.any(user_mask):
+                final_mask = user_mask
+        else:
             final_mask = user_mask
 
         if self.config.get('operation_mode', 'multi') == 'single':
-            return user_mask
+            return final_mask
         else:
-            # sb3_contrib MaskablePPO with MultiDiscrete expects flat array of shape
-            # (sum(nvec),) = (num_users * num_arrays,) — all dimension masks concatenated.
-            return np.tile(user_mask, self.num_arrays)
+            return np.tile(final_mask, self.num_arrays)
 
     def _get_observation(self):
         needs_remaining = np.maximum(self.needs - self.progress, 0.0)
@@ -386,6 +474,14 @@ class UAVEnv(gym.Env):
         sinr_obs = np.clip(np.log2(1.0 + self.sinr) / 10.0, 0.0, 1.0).astype(np.float64)
         sinr_obs[user_satisfied] = 0.0
 
+        # Hardware-Aware Penalty Matrix: Query PINN for the current geometry
+        # `directions` variable holds unnormalized phi in degrees inside this function,
+        # it is normalized to `directions / 360.0` only when building the return dict.
+        pinn_matrix = self.pinn_surrogate.get_interference_matrix(directions, distance * self.config['max_range'] * 2)
+
+        # Store deterministic mask internally for baseline algorithms and fallback masking
+        self._last_conflict_matrix = conflict_matrix.flatten()
+
         return {
             'needs':          (needs_remaining / MAX_NEED).astype(np.float64),
             'directions':     (directions / 360.0).astype(np.float64),
@@ -393,4 +489,5 @@ class UAVEnv(gym.Env):
             'user_satisfied': user_satisfied.astype(np.int8),
             'remaining_time': remaining_time,
             'sinr_obs':       sinr_obs,
+            'pinn_interference_matrix': pinn_matrix.flatten().astype(np.float64),
         }

@@ -167,6 +167,38 @@ class MultiUserBaselines:
         return _single(best, self.env.num_arrays)
 
     # ------------------------------------------------------------------
+    # H-MARL baselines (Strategist outputs sectors)
+    # ------------------------------------------------------------------
+
+    def hmarl_static(self):
+        """Assigns each array to a fixed sector (e.g., Array 0 -> Sector 0)"""
+        num_sectors = self.env.config.get('num_sectors', 4)
+        return np.array([i % num_sectors for i in range(self.env.num_arrays)], dtype=int)
+
+    def hmarl_random(self):
+        """Randomly assigns arrays to any valid sector that contains users."""
+        num_sectors = self.env.config.get('num_sectors', 4)
+        # Replicate logic from env.get_action_mask() for H-MARL
+        sector_mask = np.zeros(num_sectors, dtype=bool)
+        sector_width = 360.0 / num_sectors
+        active = self._active()
+
+        for u in active:
+            loc = self.env.locations[u]
+            # Use environment's internal trigonometry parser to avoid unpacking errors from 3D to 2D
+            _, phi = self.env._calculate_direction(loc)
+            phi_mapped = (phi + 180.0) % 360.0
+            s_idx = int(phi_mapped // sector_width)
+            s_idx = min(s_idx, num_sectors - 1)
+            sector_mask[s_idx] = True
+
+        valid_sectors = np.where(sector_mask)[0]
+        if len(valid_sectors) == 0:
+            return np.zeros(self.env.num_arrays, dtype=int)
+
+        return np.random.choice(valid_sectors, size=self.env.num_arrays, replace=True)
+
+    # ------------------------------------------------------------------
     # Multi-user baselines (mode b: each array independent)
     # ------------------------------------------------------------------
 
@@ -291,3 +323,58 @@ class MultiUserBaselines:
             selected_local.append(best_idx)
 
         return active[np.array(selected_local, dtype=int)]
+
+    def multi_pinn_greedy(self):
+        """
+        PINN-Aware Greedy: Selects the most urgent users sequentially, explicitly
+        rejecting any user that falls below an isolation score threshold on the
+        environment's PINN surrogate matrix when paired with already-selected users.
+        """
+        active = self._active()
+        K = self.env.num_arrays
+        if len(active) == 0:
+            return np.zeros(K, dtype=int)
+
+        # Retrieve the PINN matrix from the environment's observation state
+        obs = self.env._get_observation()
+        N = self.env.num_users
+        pinn_matrix = obs['pinn_interference_matrix'].reshape((N, N))
+
+        remaining = self.env.needs - self.env.progress
+
+        # Sort active users by urgency (highest remaining need first)
+        sorted_active = active[np.argsort(-remaining[active])]
+
+        selected = []
+
+        # First array takes the absolute highest urgency user
+        selected.append(sorted_active[0])
+
+        # Subsequent arrays pick the highest urgency user that survives the PINN mask
+        for _ in range(1, K):
+            best_candidate = None
+
+            for candidate in sorted_active:
+                if candidate in selected:
+                    continue
+
+                # Check if the candidate is physically compatible with ALL already-selected users
+                is_safe = True
+                for already_picked in selected:
+                    # Look for high isolation score
+                    if pinn_matrix[candidate, already_picked] < 0.05: # very aggressive threshold to find any isolation
+                        is_safe = False
+                        break
+
+                if is_safe:
+                    best_candidate = candidate
+                    break
+
+            if best_candidate is not None:
+                selected.append(best_candidate)
+            else:
+                # If no user is safe from interference, fallback to picking the same user
+                # to trigger coherent combining (DoF sacrifice rather than interference suicide)
+                selected.append(selected[-1])
+
+        return np.array(selected, dtype=int)
